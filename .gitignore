@@ -13,3 +13,6 @@ TOKEN
 
 densegridencoder
 tets/256_tets.npz
+exps/
+*.ipynb_checkpoints*
+*.ipynb

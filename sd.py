@@ -1,11 +1,12 @@
 from transformers import CLIPTextModel, CLIPTokenizer, logging
-from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline
+from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline, ControlNetModel, StableDiffusionInstructPix2PixPipeline
 from diffusers.utils.import_utils import is_xformers_available
 from os.path import isfile
 
 # suppress partial model loading warning
 logging.set_verbosity_error()
 
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,7 +41,7 @@ class UNet2DConditionOutput:
     sample: torch.HalfTensor # Not sure how to check what unet_traced.pt contains, and user wants. HalfTensor or FloatTensor
 
 class StableDiffusion(nn.Module):
-    def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98]):
+    def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98], use_control=True):
         super().__init__()
 
         self.device = device
@@ -52,32 +53,41 @@ class StableDiffusion(nn.Module):
             print(f'[INFO] using hugging face custom model key: {hf_key}')
             model_key = hf_key
         elif self.sd_version == '2.1':
-            model_key = "stabilityai/stable-diffusion-2-1-base"
+            model_key = "/storage/local/hanxiao/models/stable-diffusion-2-1-base"
         elif self.sd_version == '2.0':
             model_key = "stabilityai/stable-diffusion-2-base"
         elif self.sd_version == '1.5':
-            model_key = "runwayml/stable-diffusion-v1-5"
+            model_key = "/storage/local/hanxiao/models/stable-diffusion-v1-5"
+        elif self.sd_version == 'back':
+            model_key = "/storage/local/hanxiao/models/textual_inversion_back"
+        elif self.sd_version == 'ip2p':
+            model_key = "/storage/local/hanxiao/models/instruct-pix2pix"
         else:
             raise ValueError(f'Stable-diffusion version {self.sd_version} not supported.')
 
         precision_t = torch.float16 if fp16 else torch.float32
 
         # Create model
-        pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=precision_t)
+        if self.sd_version == 'ip2p':
+            pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                model_key, 
+                safety_checker=None, 
+                torch_dtype=precision_t,
+            )
 
-        if isfile('./unet_traced.pt'):
-            # use jitted unet
-            unet_traced = torch.jit.load('./unet_traced.pt')
-            class TracedUNet(torch.nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.in_channels = pipe.unet.in_channels
-                    self.device = pipe.unet.device
+#         if isfile('./unet_traced.pt'):
+#             # use jitted unet
+#             unet_traced = torch.jit.load('./unet_traced.pt')
+#             class TracedUNet(torch.nn.Module):
+#                 def __init__(self):
+#                     super().__init__()
+#                     self.in_channels = pipe.unet.in_channels
+#                     self.device = pipe.unet.device
 
-                def forward(self, latent_model_input, t, encoder_hidden_states):
-                    sample = unet_traced(latent_model_input, t, encoder_hidden_states)[0]
-                    return UNet2DConditionOutput(sample=sample)
-            pipe.unet = TracedUNet()
+#                 def forward(self, latent_model_input, t, encoder_hidden_states):
+#                     sample = unet_traced(latent_model_input, t, encoder_hidden_states)[0]
+#                     return UNet2DConditionOutput(sample=sample)
+#             pipe.unet = TracedUNet()
 
         if vram_O:
             pipe.enable_sequential_cpu_offload()
@@ -94,6 +104,21 @@ class StableDiffusion(nn.Module):
         self.tokenizer = pipe.tokenizer
         self.text_encoder = pipe.text_encoder
         self.unet = pipe.unet
+        
+        if use_control:
+            if self.sd_version == '1.5' or self.sd_version == 'back':
+                self.controlnet = ControlNetModel.from_pretrained(
+                    "/storage/local/hanxiao/models/ControlNetMediaPipeFace",
+                    torch_dtype=torch.float16,
+                    # variant="fp16",
+                    # subfolder="diffusion_sd15",
+                ).to(device)
+            elif self.sd_version == '2.1':
+                self.controlnet = ControlNetModel.from_pretrained(
+                    "CrucibleAI/ControlNetMediaPipeFace",
+                    torch_dtype=torch.float16,
+                    variant="fp16",
+                ).to(device)
 
         self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
 
@@ -124,8 +149,9 @@ class StableDiffusion(nn.Module):
         return text_embeddings
 
 
-    def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, as_latent=False, grad_clip=None):
-        
+    def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, as_latent=False, grad_clip=None, control=None):
+        B = pred_rgb.shape[0]
+
         if as_latent:
             latents = F.interpolate(pred_rgb, (64, 64), mode='bilinear', align_corners=False) * 2 - 1
         else:
@@ -135,7 +161,7 @@ class StableDiffusion(nn.Module):
             latents = self.encode_imgs(pred_rgb_512)
 
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
-        t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
+        t = torch.randint(self.min_step, self.max_step + 1, [B], dtype=torch.long, device=self.device)
 
         # predict the noise residual with unet, NO grad!
         with torch.no_grad():
@@ -143,21 +169,65 @@ class StableDiffusion(nn.Module):
             noise = torch.randn_like(latents)
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             # pred noise
-            latent_model_input = torch.cat([latents_noisy] * 2)
-            # Save input tensors for UNet
-            #torch.save(latent_model_input, "train_latent_model_input.pt")
-            #torch.save(t, "train_t.pt")
-            #torch.save(text_embeddings, "train_text_embeddings.pt")
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+            if self.sd_version == "ip2p":
+                # The latents are expanded 3 times because for pix2pix the guidance \
+                # is applied for both the text and the input image.
+                latent_model_input = torch.cat([latents_noisy] * 3)
+                tt = torch.cat([t] * 3)
+                # pix2pix has two  negative embeddings, and unlike in other pipelines latents are ordered like \
+                # [prompt_embeds, negative_prompt_embeds, negative_prompt_embeds]
+                negative_prompt_embeds, prompt_embeds = text_embeddings.chunk(2)
+                text_embeddings = torch.cat([prompt_embeds, negative_prompt_embeds, negative_prompt_embeds], dim=0)
+                condition_latents = copy.deepcopy(latents.detach())
+                condition_latents = torch.cat([condition_latents, condition_latents, torch.zeros_like(condition_latents)], dim=0)
+                inputs = torch.cat([latent_model_input, condition_latents], dim=1)
+                noise_pred = self.unet(inputs, tt, encoder_hidden_states=text_embeddings).sample
+                # Dual guidance here
+                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                # TODO: tune values
+                noise_pred = (
+                    noise_pred_uncond
+                    + 7.5 * (noise_pred_text - noise_pred_image)
+                    + 1.5 * (noise_pred_image - noise_pred_uncond)
+                )
+            else:
+                latent_model_input = torch.cat([latents_noisy] * 2)
+                tt = torch.cat([t] * 2)
+                if control is None:
+                    noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
+                else:
+                    control = torch.cat([control] * 2)
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        latent_model_input,
+                        tt,
+                        encoder_hidden_states=text_embeddings,
+                        controlnet_cond=control,
+                        conditioning_scale=1.0,
+                        return_dict=False,
+                    )
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        tt,
+                        encoder_hidden_states=text_embeddings,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                    ).sample
+                    is_back = control.sum(dim=3).sum(dim=2).sum(dim=1).eq(0)
+                    if not torch.all(~is_back):
+                        noise_pred_back = self.unet(
+                            latent_model_input[is_back], tt[is_back], encoder_hidden_states=text_embeddings[is_back]
+                        ).sample
+                        noise_pred[is_back] = noise_pred_back
 
-        # perform guidance (high scale from paper!)
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                # perform guidance (high scale from paper!)
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
         # w(t), sigma_t^2
-        w = (1 - self.alphas[t])
-        # w = self.alphas[t] ** 0.5 * (1 - self.alphas[t])
-        grad = w * (noise_pred - noise)
+        # w = (1 - self.alphas[t])
+        w = self.alphas[t] ** 0.5 * (1 - self.alphas[t])
+        grad = w.view(-1, 1, 1, 1) * (noise_pred - noise)
 
         if grad_clip is not None:
             grad = grad.clamp(-grad_clip, grad_clip)
@@ -271,7 +341,3 @@ if __name__ == '__main__':
     # visualize image
     plt.imshow(imgs[0])
     plt.show()
-
-
-
-

@@ -115,3 +115,22 @@ def clean_mesh(verts, faces, v_pct=1, min_f=8, min_d=5, repair=True, remesh=True
     print(f'[INFO] mesh cleaning: {_ori_vert_shape} --> {verts.shape}, {_ori_face_shape} --> {faces.shape}')
 
     return verts, faces    
+
+def normalize_mesh(verts, target_scale=0.5):
+    # Compute center of bounding box
+    # center = torch.mean(torch.column_stack([torch.max(verts, dim=0)[0], torch.min(verts, dim=0)[0]]))
+    center = verts.mean(axis=0)
+    # print(center)
+    verts = verts - center
+    # a = np.linalg.norm(verts, axis=1)
+    # print(a, a.shape, a.min(), a.max())
+
+    scale = np.max(np.linalg.norm(verts, axis=1))
+    # print(scale)
+    # print(verts.shape)
+    # scale = verts[:, 1].max() - verts[:, 1].min()
+    verts = (verts / scale) * target_scale
+    # verts[:, 1] = verts[:, 1] + 0.3
+    # verts[:, 2] = -verts[:, 2]
+
+    return verts

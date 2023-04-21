@@ -21,6 +21,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
+from kornia.color.hsv import rgb_to_hsv
 
 import trimesh
 from rich.console import Console
@@ -200,7 +201,7 @@ class Trainer(object):
         model.to(self.device)
         if self.world_size > 1:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
         self.model = model
 
         # guide model
@@ -242,6 +243,16 @@ class Trainer(object):
             self.ema = None
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.fp16)
+        
+        if self.opt.lambda_identity > 0:
+            from arcface.iresnet import iresnet100
+            weight = torch.load("/storage/local/hanxiao/models/backbone.pth")
+            self.arcface = iresnet100()
+            self.arcface.load_state_dict(weight)
+            self.arcface.cuda().eval()
+            with torch.no_grad():
+                self.src_feats = self.arcface(self.model.src_img)
+                self.src_feats = F.normalize(self.src_feats, p=2, dim=-1)
 
         # variable init
         self.epoch = 0
@@ -309,6 +320,9 @@ class Trainer(object):
             for d in ['front', 'side', 'back', 'side', 'overhead', 'bottom']:
                 # construct dir-encoded text
                 text = f"{self.opt.text}, {d} view"
+                
+                if d == "back" and self.opt.sd_version == "back":
+                    text = f"{text}, <back-view>, without eyes, without faces"
 
                 negative_text = f"{self.opt.negative}"
 
@@ -324,6 +338,7 @@ class Trainer(object):
                 
                 text_z = self.guidance.get_text_embeds([text], [negative_text])
                 self.text_z.append(text_z)
+            self.text_z = torch.stack(self.text_z)
 
     def __del__(self):
         if self.log_ptr: 
@@ -349,21 +364,28 @@ class Trainer(object):
 
         B, N = rays_o.shape[:2]
         H, W = data['H'], data['W']
-
+        
         if self.global_step < self.opt.warmup_iters:
-            ambient_ratio = 1.0
-            shading = 'normal'
-            as_latent = True
-            bg_color = None
+            if self.opt.albedo:
+                ambient_ratio = 1.0
+                shading = 'albedo'
+                as_latent = False
+                bg_color = None
+            else:
+                ambient_ratio = 1.0
+                shading = 'normal'
+                as_latent = True if not self.opt.dmtet else False
+                bg_color = None
         else: 
             ambient_ratio = 0.1 + 0.9 * random.random()
             rand = random.random()
+            # shading = 'normal'
             if rand > 0.8: 
-                shading = 'textureless'
+                shading = 'normal'
             else: 
                 shading = 'lambertian'
             as_latent = False
-        
+
             if random.random() > 0.5:
                 bg_color = None # use bg_net
             else:
@@ -372,7 +394,25 @@ class Trainer(object):
         # TODO: binarize is not working properly... should supervise both binarized/non-binarized image at the same time...
         binarize = False # if self.global_step < self.opt.iters * 0.5 else True
         
-        outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=False, perturb=True, bg_color=bg_color, ambient_ratio=ambient_ratio, shading=shading, binarize=binarize)
+        if self.opt.flame and self.opt.mp_control:
+            outputs = self.model(
+                rays_o, 
+                rays_d, 
+                mvp, 
+                H, 
+                W, 
+                staged=False, 
+                perturb=True, 
+                bg_color=bg_color, 
+                ambient_ratio=ambient_ratio, 
+                shading=shading,
+                binarize=binarize,
+                perspective_matrix=data["perspective_matrix"],
+                world2camera_matrix=data["world2camera_matrix"],
+                dirs=data["dir"],
+            )
+        else:
+            outputs = self.model(rays_o, rays_d, mvp, H, W, staged=False, perturb=True, bg_color=bg_color, ambient_ratio=ambient_ratio, shading=shading, binarize=binarize)
         pred_depth = outputs['depth'].reshape(B, 1, H, W)
 
         if as_latent:
@@ -382,13 +422,25 @@ class Trainer(object):
 
         # text embeddings
         if self.opt.dir_text:
-            dirs = data['dir'] # [B,]
-            text_z = self.text_z[dirs]
+            dirs = data["dir"]  # [B,]
+            all_pos = []
+            all_neg = []
+            for emb in self.text_z[dirs]:  # list of [2, S, -1]
+                # Name flipped
+                pos, neg = emb.chunk(2)  # [1, S, -1]
+                all_pos.append(pos)
+                all_neg.append(neg)
+            text_z = torch.cat(all_pos + all_neg, dim=0)  # [2B, S, -1]
         else:
             text_z = self.text_z
         
         # encode pred_rgb to latents
-        loss = self.guidance.train_step(text_z, pred_rgb, as_latent=as_latent)
+        loss = self.guidance.train_step(
+            text_z, 
+            pred_rgb, 
+            as_latent=as_latent,
+            control=outputs["mp_control"] if self.opt.flame and self.opt.mp_control else None,
+        )
 
         # regularizations
         if not self.opt.dmtet:
@@ -409,12 +461,40 @@ class Trainer(object):
             if self.opt.lambda_orient > 0 and 'loss_orient' in outputs:
                 loss_orient = outputs['loss_orient']
                 loss = loss + self.opt.lambda_orient * loss_orient
+                
+            if self.opt.lambda_normal_consistency > 0 and 'loss_norm_con' in outputs:
+                loss_norm_con = outputs['loss_norm_con']
+                loss = loss + self.opt.lambda_normal_consistency * loss_norm_con
+            
+            if self.opt.lambda_identity > 0 and outputs["front_faces"] is not None:
+                self.arcface.eval()
+                with torch.no_grad():
+                    front_feats = self.arcface(outputs["front_faces"])
+                    front_feats = F.normalize(front_feats, p=2, dim=-1)
+                sim = self.src_feats @ front_feats.t()
+                loss_identity = 1 - sim.mean()
+                loss = loss + self.opt.lambda_identity * loss_identity
+                
         else:
             if self.opt.lambda_normal > 0:
                 loss = loss + self.opt.lambda_normal * outputs['normal_loss']
             
             if self.opt.lambda_lap > 0:
                 loss = loss + self.opt.lambda_lap * outputs['lap_loss']
+            
+            if self.opt.lambda_saturation > 0:
+                pred_hsv = rgb_to_hsv(pred_rgb)
+                loss_saturation = pred_hsv[:, 1].mean() - pred_hsv[:, 2].mean()
+                loss = loss + self.opt.lambda_saturation * loss_saturation
+            
+            if self.opt.lambda_identity > 0 and outputs["front_faces"] is not None:
+                self.arcface.eval()
+                with torch.no_grad():
+                    front_feats = self.arcface(outputs["front_faces"])
+                    front_feats = F.normalize(front_feats, p=2, dim=-1)
+                sim = self.src_feats @ front_feats.t()
+                loss_identity = 1 - sim.mean()
+                loss = loss + self.opt.lambda_identity * loss_identity
 
         return pred_rgb, pred_depth, loss
     
@@ -441,7 +521,7 @@ class Trainer(object):
         ambient_ratio = data['ambient_ratio'] if 'ambient_ratio' in data else 1.0
         light_d = data['light_d'] if 'light_d' in data else None
 
-        outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=True, perturb=False, bg_color=None, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading)
+        outputs = self.model(rays_o, rays_d, mvp, H, W, staged=True, perturb=False, bg_color=None, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading)
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
 
@@ -460,12 +540,15 @@ class Trainer(object):
 
         if bg_color is not None:
             bg_color = bg_color.to(rays_o.device)
+        else:
+            if self.opt.dmtet:
+                bg_color = torch.ones(3).to(rays_o.device)
 
-        shading = data['shading'] if 'shading' in data else 'albedo'
-        ambient_ratio = data['ambient_ratio'] if 'ambient_ratio' in data else 1.0
+        shading = data['shading'] if 'shading' in data else self.opt.test_shading
+        ambient_ratio = data['ambient_ratio'] if 'ambient_ratio' in data else 0.8
         light_d = data['light_d'] if 'light_d' in data else None
 
-        outputs = self.model.render(rays_o, rays_d, mvp, H, W, staged=True, perturb=perturb, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading, bg_color=bg_color)
+        outputs = self.model(rays_o, rays_d, mvp, H, W, staged=True, perturb=perturb, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading, bg_color=bg_color)
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
@@ -533,7 +616,7 @@ class Trainer(object):
         
         self.log(f"==> Start Test, save results to {save_path}")
 
-        pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        pbar = tqdm.tqdm(total=len(loader), bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         self.model.eval()
 
         if write_video:
@@ -561,7 +644,7 @@ class Trainer(object):
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_rgb.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_depth.png'), pred_depth)
 
-                pbar.update(loader.batch_size)
+                pbar.update(1)
 
         if write_video:
             all_preds = np.stack(all_preds, axis=0)
@@ -591,7 +674,7 @@ class Trainer(object):
                 data = next(loader)
 
             # update grid every 16 steps
-            if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
+            if self.opt.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     self.model.update_extra_state()
             
@@ -707,16 +790,19 @@ class Trainer(object):
             loader.sampler.set_epoch(self.epoch)
         
         if self.local_rank == 0:
-            pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+            pbar = tqdm.tqdm(total=len(loader), bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         self.local_step = 0
 
         for data in loader:
             
             # update grid every 16 steps
-            if (self.model.cuda_ray or self.model.taichi_ray) and self.global_step % self.opt.update_extra_interval == 0:
+            if (self.opt.cuda_ray or self.opt.taichi_ray) and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    self.model.update_extra_state()
+                    if self.opt.multi_gpu:
+                        self.model.module.update_extra_state()
+                    else:
+                        self.model.update_extra_state()
                     
             self.local_step += 1
             self.global_step += 1
@@ -750,7 +836,7 @@ class Trainer(object):
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
-                pbar.update(loader.batch_size)
+                pbar.update(1)
 
         if self.ema is not None:
             self.ema.update()
@@ -794,7 +880,7 @@ class Trainer(object):
             self.ema.copy_to()
 
         if self.local_rank == 0:
-            pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+            pbar = tqdm.tqdm(total=len(loader), bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         with torch.no_grad():
             self.local_step = 0
@@ -842,7 +928,7 @@ class Trainer(object):
                     cv2.imwrite(save_path_depth, pred_depth)
 
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
-                    pbar.update(loader.batch_size)
+                    pbar.update(1)
 
 
         average_loss = total_loss / self.local_step
@@ -877,12 +963,14 @@ class Trainer(object):
             'global_step': self.global_step,
             'stats': self.stats,
         }
+        
+        model = self.model.module if self.opt.multi_gpu else self.model
 
-        if self.model.cuda_ray:
-            state['mean_density'] = self.model.mean_density
+        if self.opt.cuda_ray:
+            state['mean_density'] = model.mean_density
         
         if self.opt.dmtet:
-            state['tet_scale'] = self.model.tet_scale
+            state['tet_scale'] = model.tet_scale
 
         if full:
             state['optimizer'] = self.optimizer.state_dict()
@@ -893,7 +981,7 @@ class Trainer(object):
         
         if not best:
 
-            state['model'] = self.model.state_dict()
+            state['model'] = model.state_dict()
 
             file_path = f"{name}.pth"
 
@@ -918,7 +1006,7 @@ class Trainer(object):
                         self.ema.store()
                         self.ema.copy_to()
 
-                    state['model'] = self.model.state_dict()
+                    state['model'] = model.state_dict()
 
                     if self.ema is not None:
                         self.ema.restore()
@@ -958,7 +1046,7 @@ class Trainer(object):
             except:
                 self.log("[WARN] failed to loaded EMA.")
 
-        if self.model.cuda_ray:
+        if self.opt.cuda_ray:
             if 'mean_density' in checkpoint_dict:
                 self.model.mean_density = checkpoint_dict['mean_density']
             

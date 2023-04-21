@@ -12,6 +12,7 @@ import trimesh
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from .utils import get_rays, safe_normalize
 
@@ -49,7 +50,7 @@ def visualize_poses(poses, dirs, size=0.1):
 
     trimesh.Scene(objects).show()
 
-def get_view_direction(thetas, phis, overhead, front):
+def get_view_direction(thetas, phis, overhead, front, back):
     #                   phis [B,];          thetas: [B,]
     # front = 0         [0, front)
     # side (left) = 1   [front, 180)
@@ -60,16 +61,16 @@ def get_view_direction(thetas, phis, overhead, front):
     res = torch.zeros(thetas.shape[0], dtype=torch.long)
     # first determine by phis
     res[(phis < front / 2) | (phis >= 2 * np.pi - front / 2)] = 0
-    res[(phis >= front / 2) & (phis < np.pi - front / 2)] = 1
-    res[(phis >= np.pi - front / 2) & (phis < np.pi + front / 2)] = 2
-    res[(phis >= np.pi + front / 2) & (phis < 2 * np.pi - front / 2)] = 3
+    res[(phis >= front / 2) & (phis < np.pi - back / 2)] = 1
+    res[(phis >= np.pi - back / 2) & (phis < np.pi + back / 2)] = 2
+    res[(phis >= np.pi + back / 2) & (phis < 2 * np.pi - front / 2)] = 3
     # override by thetas
     res[thetas <= overhead] = 4
     res[thetas >= (np.pi - overhead)] = 5
     return res
 
 
-def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[0, 120], phi_range=[0, 360], return_dirs=False, angle_overhead=30, angle_front=60, jitter=False, uniform_sphere_rate=0.5):
+def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[25, 110], phi_range=[0, 360], return_dirs=False, angle_overhead=30, angle_front=70, angle_back=70, jitter=False, uniform_sphere_rate=0.5):
     ''' generate random poses from an orbit camera
     Args:
         size: batch size of generated poses.
@@ -85,30 +86,45 @@ def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[0, 120], phi_ra
     phi_range = np.deg2rad(phi_range)
     angle_overhead = np.deg2rad(angle_overhead)
     angle_front = np.deg2rad(angle_front)
+    angle_back = np.deg2rad(angle_back)
     
     radius = torch.rand(size, device=device) * (radius_range[1] - radius_range[0]) + radius_range[0]
-
-    if random.random() < uniform_sphere_rate:
-        unit_centers = F.normalize(
-            torch.stack([
-                (torch.rand(size, device=device) - 0.5) * 2.0,
-                torch.rand(size, device=device),
-                (torch.rand(size, device=device) - 0.5) * 2.0,
-            ], dim=-1), p=2, dim=1
-        )
-        thetas = torch.acos(unit_centers[:,1])
-        phis = torch.atan2(unit_centers[:,0], unit_centers[:,2])
-        phis[phis < 0] += 2 * np.pi
-        centers = unit_centers * radius.unsqueeze(-1)
-    else:
+    
+    # A temp hack soultion here, need to fix
+    if size == 4:
+        front_phi = torch.rand(1, device=device) * angle_front - angle_front / 2
+        back_phi = torch.rand(1, device=device) * angle_back + np.pi - angle_back / 2
+        left_phi = torch.rand(1, device=device) * (np.pi - angle_back / 2 - angle_front / 2) + angle_front / 2
+        right_phi = torch.rand(1, device=device) * (np.pi - angle_front / 2 - angle_back / 2) + np.pi + angle_back / 2
+        phis = torch.cat([front_phi, back_phi, left_phi, right_phi])
         thetas = torch.rand(size, device=device) * (theta_range[1] - theta_range[0]) + theta_range[0]
-        phis = torch.rand(size, device=device) * (phi_range[1] - phi_range[0]) + phi_range[0]
-
         centers = torch.stack([
-            radius * torch.sin(thetas) * torch.sin(phis),
-            radius * torch.cos(thetas),
-            radius * torch.sin(thetas) * torch.cos(phis),
-        ], dim=-1) # [B, 3]
+                radius * torch.sin(thetas) * torch.sin(phis),
+                radius * torch.cos(thetas),
+                radius * torch.sin(thetas) * torch.cos(phis),
+            ], dim=-1) # [B, 3]
+    else:
+        if random.random() < uniform_sphere_rate:
+            unit_centers = F.normalize(
+                torch.stack([
+                    (torch.rand(size, device=device) - 0.5) * 2.0,
+                    torch.rand(size, device=device),
+                    (torch.rand(size, device=device) - 0.5) * 2.0,
+                ], dim=-1), p=2, dim=1
+            )
+            thetas = torch.acos(unit_centers[:,1])
+            phis = torch.atan2(unit_centers[:,0], unit_centers[:,2])
+            phis[phis < 0] += 2 * np.pi
+            centers = unit_centers * radius.unsqueeze(-1)
+        else:
+            thetas = torch.rand(size, device=device) * (theta_range[1] - theta_range[0]) + theta_range[0]
+            phis = torch.rand(size, device=device) * (phi_range[1] - phi_range[0]) + phi_range[0]
+
+            centers = torch.stack([
+                radius * torch.sin(thetas) * torch.sin(phis),
+                radius * torch.cos(thetas),
+                radius * torch.sin(thetas) * torch.cos(phis),
+            ], dim=-1) # [B, 3]
 
     targets = 0
 
@@ -134,19 +150,20 @@ def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[0, 120], phi_ra
     poses[:, :3, 3] = centers
 
     if return_dirs:
-        dirs = get_view_direction(thetas, phis, angle_overhead, angle_front)
+        dirs = get_view_direction(thetas, phis, angle_overhead, angle_front, angle_back)
     else:
         dirs = None
     
     return poses, dirs
 
 
-def circle_poses(device, radius=1.25, theta=60, phi=0, return_dirs=False, angle_overhead=30, angle_front=60):
+def circle_poses(device, radius=1.25, theta=60, phi=0, return_dirs=False, angle_overhead=30, angle_front=70, angle_back=70):
 
     theta = np.deg2rad(theta)
     phi = np.deg2rad(phi)
     angle_overhead = np.deg2rad(angle_overhead)
     angle_front = np.deg2rad(angle_front)
+    angle_back = np.deg2rad(angle_back)
 
     thetas = torch.FloatTensor([theta]).to(device)
     phis = torch.FloatTensor([phi]).to(device)
@@ -168,7 +185,7 @@ def circle_poses(device, radius=1.25, theta=60, phi=0, return_dirs=False, angle_
     poses[:, :3, 3] = centers
 
     if return_dirs:
-        dirs = get_view_direction(thetas, phis, angle_overhead, angle_front)
+        dirs = get_view_direction(thetas, phis, angle_overhead, angle_front, angle_back)
     else:
         dirs = None
     
@@ -206,17 +223,18 @@ class NeRFDataset:
 
         if self.training:
             # random pose on the fly
-            poses, dirs = rand_poses(B, self.device, radius_range=self.opt.radius_range, return_dirs=self.opt.dir_text, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, jitter=self.opt.jitter_pose, uniform_sphere_rate=self.opt.uniform_sphere_rate)
+            poses, dirs = rand_poses(B, self.device, radius_range=self.opt.radius_range, return_dirs=self.opt.dir_text, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, angle_back=self.opt.angle_back, jitter=self.opt.jitter_pose, uniform_sphere_rate=self.opt.uniform_sphere_rate)
 
             # random focal
             fov = random.random() * (self.opt.fovy_range[1] - self.opt.fovy_range[0]) + self.opt.fovy_range[0]
         else:
             # circle pose
             phi = (index[0] / self.size) * 360
-            poses, dirs = circle_poses(self.device, radius=self.opt.radius_range[1] * 1.2, theta=60, phi=phi, return_dirs=self.opt.dir_text, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front)
+            poses, dirs = circle_poses(self.device, radius=self.opt.radius_range[1] * 1.2, theta=80, phi=phi, return_dirs=self.opt.dir_text, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, angle_back=self.opt.angle_back)
 
             # fixed focal
-            fov = 60 # (self.opt.fovy_range[1] + self.opt.fovy_range[0]) / 2
+            # fov = 60 
+            fov = (self.opt.fovy_range[1] + self.opt.fovy_range[0]) / 2
 
         focal = self.H / (2 * np.tan(np.deg2rad(fov) / 2))
         intrinsics = np.array([focal, focal, self.cx, self.cy])
@@ -232,6 +250,17 @@ class NeRFDataset:
         
         # sample a low-resolution but full image
         rays = get_rays(poses, intrinsics, self.H, self.W, -1)
+        
+        focal = 512 / (2 * np.tan(np.deg2rad(fov) / 2))
+        perspective_matrix = torch.Tensor(
+            [
+                [focal, 0, 256, 0],
+                [0, focal, 256, 0],
+                [0, 0, 1, 0],
+                [0, 0, self.near, 0],
+            ]
+        ).cuda().unsqueeze(0).expand(B, -1, -1)
+        world2camera_matrix = torch.inverse(poses)  # Bx4x4
 
         data = {
             'H': self.H,
@@ -240,11 +269,19 @@ class NeRFDataset:
             'rays_d': rays['rays_d'],
             'dir': dirs,
             'mvp': mvp,
+            'perspective_matrix': perspective_matrix,
+            'world2camera_matrix': world2camera_matrix,
         }
 
         return data
 
 
-    def dataloader(self):
-        loader = DataLoader(list(range(self.size)), batch_size=1, collate_fn=self.collate, shuffle=self.training, num_workers=0)
+    def dataloader(self, batch_size=1):
+        dataset = list(range(self.size))
+        if self.opt.multi_gpu and self.training:
+            sampler = DistributedSampler(dataset)
+            # batch_size = batch_size * self.opt.world_size
+            loader = DataLoader(dataset, sampler=sampler, batch_size=batch_size, collate_fn=self.collate, num_workers=0, drop_last=True)
+            return loader
+        loader = DataLoader(dataset, batch_size=batch_size, collate_fn=self.collate, shuffle=self.training, num_workers=0)
         return loader

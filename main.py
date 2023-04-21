@@ -1,6 +1,7 @@
 import torch
 import argparse
 import sys
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nerf.provider import NeRFDataset
 from nerf.utils import *
@@ -17,7 +18,7 @@ if __name__ == '__main__':
     parser.add_argument('-O', action='store_true', help="equals --fp16 --cuda_ray --dir_text")
     parser.add_argument('-O2', action='store_true', help="equals --backbone vanilla --dir_text")
     parser.add_argument('--test', action='store_true', help="test mode")
-    parser.add_argument('--eval_interval', type=int, default=1, help="evaluate on the valid set every interval epochs")
+    parser.add_argument('--eval_interval', type=int, default=5, help="evaluate on the valid set every interval epochs")
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--guidance', type=str, default='stable-diffusion', help='choose from [stable-diffusion, clip]')
     parser.add_argument('--seed', default=None)
@@ -29,8 +30,16 @@ if __name__ == '__main__':
     parser.add_argument('--dmtet', action='store_true', help="use dmtet finetuning")
     parser.add_argument('--tet_grid_size', type=int, default=128, help="tet grid size")
     parser.add_argument('--init_ckpt', type=str, default='', help="ckpt to init dmtet")
+    
+    parser.add_argument('--flame', action='store_true', help="use flame guide density")
+    parser.add_argument('--mp_control', action='store_true', help="use MediaPipe control net")
+    parser.add_argument('--normal_net', action='store_true', help="use normal net")
+    parser.add_argument('--albedo', action='store_true', help="only using albedo for shading during training")
+    parser.add_argument('--beta', type=float, default=1e-3, help="beta for sdf-guided density")
+    parser.add_argument('--test_shading', type=str, default='albedo', choices=['albedo', 'normal', 'textureless', 'lambertian'], help="method used for test shading")
 
     ### training options
+    parser.add_argument('--bs', type=int, default=1, help="batch size")
     parser.add_argument('--iters', type=int, default=10000, help="training iters")
     parser.add_argument('--lr', type=float, default=1e-3, help="max learning rate")
     parser.add_argument('--warm_iters', type=int, default=500, help="training iters")
@@ -43,19 +52,19 @@ if __name__ == '__main__':
     parser.add_argument('--upsample_steps', type=int, default=32, help="num steps up-sampled per ray (only valid when not using --cuda_ray)")
     parser.add_argument('--update_extra_interval', type=int, default=16, help="iter interval to update extra status (only valid when using --cuda_ray)")
     parser.add_argument('--max_ray_batch', type=int, default=4096, help="batch size of rays at inference to avoid OOM (only valid when not using --cuda_ray)")
-    parser.add_argument('--warmup_iters', type=int, default=2000, help="training iters that only use albedo shading")
+    parser.add_argument('--warmup_iters', type=int, default=2000, help="training iters that only use albedo/normal shading")
     parser.add_argument('--jitter_pose', action='store_true', help="add jitters to the randomly sampled camera poses")
     parser.add_argument('--uniform_sphere_rate', type=float, default=0.5, help="likelihood of sampling camera location uniformly on the sphere surface area")
     # model options
     parser.add_argument('--bg_radius', type=float, default=1.4, help="if positive, use a background model at sphere(bg_radius)")
     parser.add_argument('--density_activation', type=str, default='softplus', choices=['softplus', 'exp'], help="density activation function")
-    parser.add_argument('--density_thresh', type=float, default=0.1, help="threshold for density grid to be occupied")
-    parser.add_argument('--blob_density', type=float, default=10, help="max (center) density for the density blob")
+    parser.add_argument('--density_thresh', type=float, default=10, help="threshold for density grid to be occupied")
+    parser.add_argument('--blob_density', type=float, default=5, help="max (center) density for the density blob")
     parser.add_argument('--blob_radius', type=float, default=0.5, help="control the radius for the density blob")
     # network backbone
     parser.add_argument('--backbone', type=str, default='grid', choices=['grid', 'vanilla', 'grid_taichi'], help="nerf backbone")
-    parser.add_argument('--optim', type=str, default='adan', choices=['adan', 'adam'], help="optimizer")
-    parser.add_argument('--sd_version', type=str, default='2.1', choices=['1.5', '2.0', '2.1'], help="stable diffusion version")
+    parser.add_argument('--optim', type=str, default='adam', choices=['adan', 'adam'], help="optimizer")
+    parser.add_argument('--sd_version', type=str, default='1.5', choices=['1.5', '2.0', '2.1', 'back', 'ip2p'], help="stable diffusion version")
     parser.add_argument('--hf_key', type=str, default=None, help="hugging face Stable diffusion model key")
     # try this if CUDA OOM
     parser.add_argument('--fp16', action='store_true', help="use float16 for training")
@@ -69,37 +78,45 @@ if __name__ == '__main__':
     parser.add_argument('--dt_gamma', type=float, default=0, help="dt_gamma (>=0) for adaptive ray marching. set to 0 to disable, >0 to accelerate rendering (but usually with worse quality)")
     parser.add_argument('--min_near', type=float, default=0.1, help="minimum near distance for camera")
     parser.add_argument('--radius_range', type=float, nargs='*', default=[1.0, 1.5], help="training camera radius range")
-    parser.add_argument('--fovy_range', type=float, nargs='*', default=[40, 80], help="training camera fovy range")
+    parser.add_argument('--fovy_range', type=float, nargs='*', default=[30, 50], help="training camera fovy range")
     parser.add_argument('--dir_text', action='store_true', help="direction-encode the text prompt, by appending front/side/back/overhead view")
     parser.add_argument('--suppress_face', action='store_true', help="also use negative dir text prompt.")
     parser.add_argument('--angle_overhead', type=float, default=30, help="[0, angle_overhead] is the overhead region")
-    parser.add_argument('--angle_front', type=float, default=60, help="[0, angle_front] is the front region, [180, 180+angle_front] the back region, otherwise the side region.")
+    parser.add_argument('--angle_front', type=float, default=70, help="[0, angle_front] is the front region, [180, 180+angle_front] the back region, otherwise the side region.")
+    parser.add_argument('--angle_back', type=float, default=70, help="[0, angle_front] is the front region, [180, 180+angle_front] the back region, otherwise the side region.")
     parser.add_argument('--t_range', type=float, nargs='*', default=[0.02, 0.98], help="stable diffusion time steps range")
 
     ### regularizations
-    parser.add_argument('--lambda_entropy', type=float, default=1e-3, help="loss scale for alpha entropy")
+    parser.add_argument('--lambda_entropy', type=float, default=5e-4, help="loss scale for alpha entropy")
     parser.add_argument('--lambda_opacity', type=float, default=0, help="loss scale for alpha value")
-    parser.add_argument('--lambda_orient', type=float, default=1e-2, help="loss scale for orientation")
+    parser.add_argument('--lambda_orient', type=float, default=5e-4, help="loss scale for orientation")
     parser.add_argument('--lambda_tv', type=float, default=0, help="loss scale for total variation")
     parser.add_argument('--lambda_normal', type=float, default=0, help="loss scale for mesh normal smoothness")
     parser.add_argument('--lambda_lap', type=float, default=0.2, help="loss scale for mesh laplacian")
+    parser.add_argument('--lambda_normal_consistency', type=float, default=0, help="loss scale for normal consistency")
+    parser.add_argument('--lambda_identity', type=float, default=0, help="loss scale for face identity loss")
+    parser.add_argument('--src_img', type=str, default="", help="the path of the src image used for arcface")
+    parser.add_argument('--lambda_saturation', type=float, default=0, help="loss scale for saturation loss")
 
     ### GUI options
     parser.add_argument('--gui', action='store_true', help="start a GUI")
-    parser.add_argument('--W', type=int, default=800, help="GUI width")
-    parser.add_argument('--H', type=int, default=800, help="GUI height")
+    parser.add_argument('--W', type=int, default=512, help="GUI width")
+    parser.add_argument('--H', type=int, default=512, help="GUI height")
     parser.add_argument('--radius', type=float, default=3, help="default GUI camera radius from center")
-    parser.add_argument('--fovy', type=float, default=60, help="default GUI camera fovy")
+    parser.add_argument('--fovy', type=float, default=40, help="default GUI camera fovy")
     parser.add_argument('--light_theta', type=float, default=60, help="default GUI light direction in [0, 180], corresponding to elevation [90, -90]")
     parser.add_argument('--light_phi', type=float, default=0, help="default GUI light direction in [0, 360), azimuth")
     parser.add_argument('--max_spp', type=int, default=1, help="GUI rendering max sample per pixel")
 
     opt = parser.parse_args()
+    
+    opt.workspace = "exps/" + opt.workspace
 
     if opt.O:
         opt.fp16 = True
         opt.dir_text = True
         opt.cuda_ray = True
+        # opt.suppress_face = True
 
     elif opt.O2:
         opt.fp16 = True
@@ -112,7 +129,7 @@ if __name__ == '__main__':
         opt.w = 512
         opt.warmup_iters = 0
         opt.t_range = [0.02, 0.50]
-        opt.fovy_range = [20, 60]
+        opt.fovy_range = [30, 50]
 
     if opt.backbone == 'vanilla':
         from nerf.network import NeRFNetwork
@@ -136,6 +153,22 @@ if __name__ == '__main__':
     if opt.seed is not None:
         seed_everything(int(opt.seed))
 
+    opt.multi_gpu = "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
+    if opt.multi_gpu:
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = "localhost"
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = "23457"
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        local_rank = torch.distributed.get_rank()
+        torch.cuda.set_device(local_rank)
+        world_size = int(os.environ["WORLD_SIZE"])
+    else:
+        local_rank = 0
+        world_size = 1
+    # opt.iters = opt.iters // (world_size * opt.bs)
+    # opt.warmup_iters = opt.warmup_iters // (world_size * opt.bs)
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model = NeRFNetwork(opt).to(device)
@@ -170,14 +203,17 @@ if __name__ == '__main__':
 
     else:
 
-        train_loader = NeRFDataset(opt, device=device, type='train', H=opt.h, W=opt.w, size=100).dataloader()
+        train_loader = NeRFDataset(opt, device=device, type='train', H=opt.h, W=opt.w, size=100*opt.bs*world_size).dataloader(batch_size=opt.bs)
 
         if opt.optim == 'adan':
             from optimizer import Adan
             # Adan usually requires a larger LR
             optimizer = lambda model: Adan(model.get_params(5 * opt.lr), eps=1e-8, weight_decay=2e-5, max_grad_norm=5.0, foreach=False)
         else: # adam
-            optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+            if opt.multi_gpu:
+                optimizer = lambda model: torch.optim.Adam(model.module.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+            else:
+                optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
 
         if opt.backbone == 'vanilla':
             warm_up_with_cosine_lr = lambda iter: iter / opt.warm_iters if iter <= opt.warm_iters \
@@ -191,15 +227,15 @@ if __name__ == '__main__':
 
         if opt.guidance == 'stable-diffusion':
             from sd import StableDiffusion
-            guidance = StableDiffusion(device, opt.fp16, opt.vram_O, opt.sd_version, opt.hf_key, opt.t_range)
+            guidance = StableDiffusion(device, opt.fp16, opt.vram_O, opt.sd_version, opt.hf_key, opt.t_range, opt.mp_control)
         elif opt.guidance == 'clip':
             from nerf.clip import CLIP
             guidance = CLIP(device)
         else:
             raise NotImplementedError(f'--guidance {opt.guidance} is not implemented.')
-
-        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer, ema_decay=None, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint=opt.ckpt, eval_interval=opt.eval_interval, scheduler_update_every_step=True)
-
+            
+        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer, ema_decay=None, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint=opt.ckpt, eval_interval=opt.eval_interval, scheduler_update_every_step=True, local_rank=local_rank, world_size=world_size)
+        
         if opt.gui:
             trainer.train_loader = train_loader # attach dataloader to trainer
 
@@ -208,6 +244,6 @@ if __name__ == '__main__':
 
         else:
             valid_loader = NeRFDataset(opt, device=device, type='val', H=opt.H, W=opt.W, size=5).dataloader()
-
-            max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
+                
+            max_epoch = opt.iters // len(train_loader)
             trainer.train(train_loader, valid_loader, max_epoch)
