@@ -118,7 +118,7 @@ def clean_mesh(verts, faces, v_pct=1, min_f=8, min_d=5, repair=True, remesh=True
 
 def normalize_mesh(verts, target_scale=0.5):
     # Compute center of bounding box
-    # center = torch.mean(torch.column_stack([torch.max(verts, dim=0)[0], torch.min(verts, dim=0)[0]]))
+    # center = (np.max(verts, axis=0) + np.min(verts, axis=0)) / 2
     center = verts.mean(axis=0)
     # print(center)
     verts = verts - center

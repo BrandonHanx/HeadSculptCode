@@ -37,6 +37,8 @@ if __name__ == '__main__':
     parser.add_argument('--albedo', action='store_true', help="only using albedo for shading during training")
     parser.add_argument('--beta', type=float, default=1e-3, help="beta for sdf-guided density")
     parser.add_argument('--test_shading', type=str, default='albedo', choices=['albedo', 'normal', 'textureless', 'lambertian'], help="method used for test shading")
+    parser.add_argument('--gs', type=float, default=100, help="text cfg scale")
+    parser.add_argument('--img_gs', type=float, default=20, help="image cfg scale")
 
     ### training options
     parser.add_argument('--bs', type=int, default=1, help="batch size")
@@ -227,7 +229,17 @@ if __name__ == '__main__':
 
         if opt.guidance == 'stable-diffusion':
             from sd import StableDiffusion
-            guidance = StableDiffusion(device, opt.fp16, opt.vram_O, opt.sd_version, opt.hf_key, opt.t_range, opt.mp_control)
+            guidance = StableDiffusion(
+                device, 
+                opt.fp16, 
+                opt.vram_O, 
+                opt.sd_version, 
+                opt.hf_key,
+                opt.t_range, 
+                opt.mp_control,
+                opt.gs,
+                opt.img_gs,
+            )
         elif opt.guidance == 'clip':
             from nerf.clip import CLIP
             guidance = CLIP(device)

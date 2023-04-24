@@ -12,6 +12,7 @@ import numpy as np
 import time
 from datetime import datetime
 
+import copy
 import cv2
 import matplotlib.pyplot as plt
 
@@ -304,6 +305,23 @@ class Trainer(object):
             else: # path to ckpt
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
+        
+        if self.opt.sd_version == "ip2p":
+            if self.opt.dmtet:
+                import nvdiffrast.torch as dr
+                # HACK: because dr is not pickable
+                self.model.glctx = None
+                self.copy_model = copy.deepcopy(self.model).eval()
+                if self.opt.gui:
+                    self.model.glctx = dr.RasterizeCudaContext()
+                    # self.copy_model.glctx = dr.RasterizeCudaContext()
+                else:
+                    self.model.glctx = dr.RasterizeGLContext()
+                    # self.copy_model.glctx = dr.RasterizeGLContext()
+            else:
+                self.copy_model = copy.deepcopy(self.model).eval()
+            for param in self.copy_model.parameters():
+                param.requires_grad = False
 
     # calculate the text embs.
     def prepare_text_embeddings(self):
@@ -433,13 +451,24 @@ class Trainer(object):
             text_z = torch.cat(all_pos + all_neg, dim=0)  # [2B, S, -1]
         else:
             text_z = self.text_z
-        
+
+        if self.opt.flame and self.opt.mp_control:
+            control = outputs["mp_control"]  
+        elif self.opt.sd_version == "ip2p":
+            with torch.no_grad():
+                self.copy_model.training = False
+                self.copy_model.eval()
+                copy_outputs = self.copy_model.run_cuda(data["copy_rays_o"], data["copy_rays_d"], staged=True, perturb=False, bg_color=None, ambient_ratio=ambient_ratio, shading=shading)
+            control = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
+        else:
+            control = None
+
         # encode pred_rgb to latents
         loss = self.guidance.train_step(
             text_z, 
             pred_rgb, 
             as_latent=as_latent,
-            control=outputs["mp_control"] if self.opt.flame and self.opt.mp_control else None,
+            control=control,
         )
 
         # regularizations
@@ -549,6 +578,24 @@ class Trainer(object):
         light_d = data['light_d'] if 'light_d' in data else None
 
         outputs = self.model(rays_o, rays_d, mvp, H, W, staged=True, perturb=perturb, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading, bg_color=bg_color)
+        # if self.opt.flame and self.opt.mp_control:
+        #     outputs = self.model(
+        #         rays_o, 
+        #         rays_d, 
+        #         mvp, 
+        #         H, 
+        #         W, 
+        #         staged=True, 
+        #         perturb=perturb, 
+        #         bg_color=bg_color, 
+        #         ambient_ratio=ambient_ratio, 
+        #         shading=shading,
+        #         perspective_matrix=data["perspective_matrix"],
+        #         world2camera_matrix=data["world2camera_matrix"],
+        #         dirs=data["dir"],
+        #     )
+        # else:
+        #     outputs = self.model(rays_o, rays_d, mvp, H, W, staged=True, perturb=perturb, light_d=light_d, ambient_ratio=ambient_ratio, shading=shading, bg_color=bg_color)
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
@@ -888,6 +935,8 @@ class Trainer(object):
             for data in loader:    
                 self.local_step += 1
 
+                if self.global_step <= self.opt.warmup_iters:
+                    data['shading'] = 'normal'
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     preds, preds_depth, loss = self.eval_step(data)
 

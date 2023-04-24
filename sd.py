@@ -41,11 +41,13 @@ class UNet2DConditionOutput:
     sample: torch.HalfTensor # Not sure how to check what unet_traced.pt contains, and user wants. HalfTensor or FloatTensor
 
 class StableDiffusion(nn.Module):
-    def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98], use_control=True):
+    def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98], use_control=True, gs=100, img_gs=20):
         super().__init__()
 
         self.device = device
         self.sd_version = sd_version
+        self.gs = gs
+        self.img_gs = img_gs
 
         print(f'[INFO] loading stable diffusion...')
 
@@ -70,6 +72,12 @@ class StableDiffusion(nn.Module):
         # Create model
         if self.sd_version == 'ip2p':
             pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                model_key, 
+                safety_checker=None, 
+                torch_dtype=precision_t,
+            )
+        else:
+            pipe = StableDiffusionPipeline.from_pretrained(
                 model_key, 
                 safety_checker=None, 
                 torch_dtype=precision_t,
@@ -149,6 +157,7 @@ class StableDiffusion(nn.Module):
         return text_embeddings
 
 
+    # HACK: this guidance_scale is not used, overwritten by self.gs
     def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, as_latent=False, grad_clip=None, control=None):
         B = pred_rgb.shape[0]
 
@@ -178,17 +187,28 @@ class StableDiffusion(nn.Module):
                 # [prompt_embeds, negative_prompt_embeds, negative_prompt_embeds]
                 negative_prompt_embeds, prompt_embeds = text_embeddings.chunk(2)
                 text_embeddings = torch.cat([prompt_embeds, negative_prompt_embeds, negative_prompt_embeds], dim=0)
-                condition_latents = copy.deepcopy(latents.detach())
+                # condition_latents = copy.deepcopy(latents.detach())
+                condition = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
+                condition_latents = self.encode_imgs(condition)
                 condition_latents = torch.cat([condition_latents, condition_latents, torch.zeros_like(condition_latents)], dim=0)
                 inputs = torch.cat([latent_model_input, condition_latents], dim=1)
-                noise_pred = self.unet(inputs, tt, encoder_hidden_states=text_embeddings).sample
-                # Dual guidance here
-                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                # noise_pred = self.unet(inputs, tt, encoder_hidden_states=text_embeddings).sample
+                # # Dual guidance here
+                # noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                # # chunk to save memory
+                # FIXME: need refactor
+                noise_pred_text = self.unet(inputs[0:B], tt[0:B], encoder_hidden_states=text_embeddings[0:B]).sample
+                noise_pred_image = self.unet(inputs[B:-B], tt[B:-B], encoder_hidden_states=text_embeddings[B:-B]).sample
+                noise_pred_uncond = self.unet(inputs[-B:], tt[-B:], encoder_hidden_states=text_embeddings[-B:]).sample
+                # noise_pred = self.unet(inputs[0:-B], tt[0:-B], encoder_hidden_states=text_embeddings[0:-B]).sample
+                # noise_pred_text, noise_pred_image = noise_pred.chunk(2)
+                # noise_pred_uncond = self.unet(inputs[-B:], tt[-B:], encoder_hidden_states=text_embeddings[-B:]).sample
+                
                 # TODO: tune values
                 noise_pred = (
                     noise_pred_uncond
-                    + 7.5 * (noise_pred_text - noise_pred_image)
-                    + 1.5 * (noise_pred_image - noise_pred_uncond)
+                    + self.gs * (noise_pred_text - noise_pred_image)
+                    + self.img_gs * (noise_pred_image - noise_pred_uncond)
                 )
             else:
                 latent_model_input = torch.cat([latents_noisy] * 2)
@@ -222,7 +242,7 @@ class StableDiffusion(nn.Module):
 
                 # perform guidance (high scale from paper!)
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                noise_pred = noise_pred_text + self.gs * (noise_pred_text - noise_pred_uncond)
 
         # w(t), sigma_t^2
         # w = (1 - self.alphas[t])

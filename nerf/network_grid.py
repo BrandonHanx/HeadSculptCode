@@ -273,8 +273,8 @@ class NeRFNetwork(NeRFRenderer):
     def get_params(self, lr):
 
         params = [
-            {'params': self.encoder.parameters(), 'lr': lr if self.opt.dmtet else lr * 10},
-            {'params': self.sigma_net.parameters(), 'lr': lr },
+            {'params': self.encoder.parameters(), 'lr': lr * 10},
+            {'params': self.sigma_net.parameters(), 'lr': lr},
         ]        
         
         if self.opt.normal_net:

@@ -238,6 +238,9 @@ class NeRFDataset:
 
         focal = self.H / (2 * np.tan(np.deg2rad(fov) / 2))
         intrinsics = np.array([focal, focal, self.cx, self.cy])
+        # HACK: fixed 64 for copy model
+        copy_focal = 64 / (2 * np.tan(np.deg2rad(fov) / 2))
+        copy_intrinsics = np.array([copy_focal, copy_focal, 32, 32])
 
         projection = torch.tensor([
             [2*focal/self.W, 0, 0, 0], 
@@ -250,6 +253,7 @@ class NeRFDataset:
         
         # sample a low-resolution but full image
         rays = get_rays(poses, intrinsics, self.H, self.W, -1)
+        copy_rays = get_rays(poses, copy_intrinsics, 64, 64, -1)
         
         focal = 512 / (2 * np.tan(np.deg2rad(fov) / 2))
         perspective_matrix = torch.Tensor(
@@ -267,6 +271,8 @@ class NeRFDataset:
             'W': self.W,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
+            'copy_rays_o': copy_rays['rays_o'],
+            'copy_rays_d': copy_rays['rays_d'],
             'dir': dirs,
             'mvp': mvp,
             'perspective_matrix': perspective_matrix,
