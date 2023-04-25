@@ -39,6 +39,7 @@ if __name__ == '__main__':
     parser.add_argument('--test_shading', type=str, default='albedo', choices=['albedo', 'normal', 'textureless', 'lambertian'], help="method used for test shading")
     parser.add_argument('--gs', type=float, default=100, help="text cfg scale")
     parser.add_argument('--img_gs', type=float, default=20, help="image cfg scale")
+    parser.add_argument('--sample_p', type=float, nargs='+', default=[1, 1, 1, 1], help="sample probability of [front, back, left, right]")
 
     ### training options
     parser.add_argument('--bs', type=int, default=1, help="batch size")
@@ -99,6 +100,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_identity', type=float, default=0, help="loss scale for face identity loss")
     parser.add_argument('--src_img', type=str, default="", help="the path of the src image used for arcface")
     parser.add_argument('--lambda_saturation', type=float, default=0, help="loss scale for saturation loss")
+    parser.add_argument('--lambda_angle', type=float, default=0, help="loss scale for angle cosine sim loss")
 
     ### GUI options
     parser.add_argument('--gui', action='store_true', help="start a GUI")

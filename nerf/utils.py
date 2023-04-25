@@ -245,15 +245,16 @@ class Trainer(object):
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.fp16)
         
-        if self.opt.lambda_identity > 0:
+        if self.opt.lambda_identity > 0 or self.opt.lambda_angle > 0:
             from arcface.iresnet import iresnet100
             weight = torch.load("/storage/local/hanxiao/models/backbone.pth")
             self.arcface = iresnet100()
             self.arcface.load_state_dict(weight)
             self.arcface.cuda().eval()
-            with torch.no_grad():
-                self.src_feats = self.arcface(self.model.src_img)
-                self.src_feats = F.normalize(self.src_feats, p=2, dim=-1)
+            if self.opt.lambda_identity > 0:
+                with torch.no_grad():
+                    self.src_feats = self.arcface(self.model.src_img)
+                    self.src_feats = F.normalize(self.src_feats, p=2, dim=-1)
 
         # variable init
         self.epoch = 0
@@ -494,15 +495,6 @@ class Trainer(object):
             if self.opt.lambda_normal_consistency > 0 and 'loss_norm_con' in outputs:
                 loss_norm_con = outputs['loss_norm_con']
                 loss = loss + self.opt.lambda_normal_consistency * loss_norm_con
-            
-            if self.opt.lambda_identity > 0 and outputs["front_faces"] is not None:
-                self.arcface.eval()
-                with torch.no_grad():
-                    front_feats = self.arcface(outputs["front_faces"])
-                    front_feats = F.normalize(front_feats, p=2, dim=-1)
-                sim = self.src_feats @ front_feats.t()
-                loss_identity = 1 - sim.mean()
-                loss = loss + self.opt.lambda_identity * loss_identity
                 
         else:
             if self.opt.lambda_normal > 0:
@@ -516,14 +508,25 @@ class Trainer(object):
                 loss_saturation = pred_hsv[:, 1].mean() - pred_hsv[:, 2].mean()
                 loss = loss + self.opt.lambda_saturation * loss_saturation
             
-            if self.opt.lambda_identity > 0 and outputs["front_faces"] is not None:
-                self.arcface.eval()
-                with torch.no_grad():
-                    front_feats = self.arcface(outputs["front_faces"])
-                    front_feats = F.normalize(front_feats, p=2, dim=-1)
-                sim = self.src_feats @ front_feats.t()
-                loss_identity = 1 - sim.mean()
-                loss = loss + self.opt.lambda_identity * loss_identity
+        if self.opt.lambda_identity > 0 and outputs["front_faces"] is not None:
+            self.arcface.eval()
+            with torch.no_grad():
+                front_feats = self.arcface(outputs["front_faces"])
+                front_feats = F.normalize(front_feats, p=2, dim=-1)
+            sim = self.src_feats @ front_feats.t()
+            loss_identity = 1 - sim.mean()
+            loss = loss + self.opt.lambda_identity * loss_identity
+        
+        if self.opt.lambda_angle > 0:
+            front_idx = data["dir"] == 0
+            if torch.any(front_idx):
+                feats = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
+                feats = F.interpolate(feats, (112, 112), mode='bilinear', align_corners=False)
+                feats = self.arcface(feats)
+                front_feats = F.normalize(feats[front_idx], p=2, dim=-1, eps=1e-5)
+                other_feats = F.normalize(feats[~front_idx], p=2, dim=-1, eps=1e-5)
+                loss_angle = front_feats @ other_feats.t()
+                loss = loss + self.opt.lambda_angle * loss_angle.mean()
 
         return pred_rgb, pred_depth, loss
     

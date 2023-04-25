@@ -70,7 +70,7 @@ def get_view_direction(thetas, phis, overhead, front, back):
     return res
 
 
-def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[25, 110], phi_range=[0, 360], return_dirs=False, angle_overhead=30, angle_front=70, angle_back=70, jitter=False, uniform_sphere_rate=0.5):
+def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[25, 110], phi_range=[0, 360], return_dirs=False, angle_overhead=30, angle_front=70, angle_back=70, jitter=False, uniform_sphere_rate=0.5, sample_p=[1, 1, 1, 1]):
     ''' generate random poses from an orbit camera
     Args:
         size: batch size of generated poses.
@@ -90,13 +90,23 @@ def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[25, 110], phi_r
     
     radius = torch.rand(size, device=device) * (radius_range[1] - radius_range[0]) + radius_range[0]
     
+    def get_phi(x):
+        if x == 0:
+            phi = torch.rand(1, device=device) * angle_front - angle_front / 2
+        elif x == 1:
+            phi = torch.rand(1, device=device) * angle_back + np.pi - angle_back / 2
+        elif x == 2:
+            phi = torch.rand(1, device=device) * (np.pi - angle_back / 2 - angle_front / 2) + angle_front / 2
+        elif x == 3:
+            phi = torch.rand(1, device=device) * (np.pi - angle_front / 2 - angle_back / 2) + np.pi + angle_back / 2
+        return phi
+    
     # A temp hack soultion here, need to fix
     if size == 4:
-        front_phi = torch.rand(1, device=device) * angle_front - angle_front / 2
-        back_phi = torch.rand(1, device=device) * angle_back + np.pi - angle_back / 2
-        left_phi = torch.rand(1, device=device) * (np.pi - angle_back / 2 - angle_front / 2) + angle_front / 2
-        right_phi = torch.rand(1, device=device) * (np.pi - angle_front / 2 - angle_back / 2) + np.pi + angle_back / 2
-        phis = torch.cat([front_phi, back_phi, left_phi, right_phi])
+        sample_p = np.array(sample_p)
+        sample_p = sample_p / np.sum(sample_p)
+        chosen_angle = np.random.choice(4, 4, p=sample_p)
+        phis = torch.cat([get_phi(x) for x in chosen_angle])
         thetas = torch.rand(size, device=device) * (theta_range[1] - theta_range[0]) + theta_range[0]
         centers = torch.stack([
                 radius * torch.sin(thetas) * torch.sin(phis),
@@ -223,7 +233,7 @@ class NeRFDataset:
 
         if self.training:
             # random pose on the fly
-            poses, dirs = rand_poses(B, self.device, radius_range=self.opt.radius_range, return_dirs=self.opt.dir_text, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, angle_back=self.opt.angle_back, jitter=self.opt.jitter_pose, uniform_sphere_rate=self.opt.uniform_sphere_rate)
+            poses, dirs = rand_poses(B, self.device, radius_range=self.opt.radius_range, return_dirs=self.opt.dir_text, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, angle_back=self.opt.angle_back, jitter=self.opt.jitter_pose, uniform_sphere_rate=self.opt.uniform_sphere_rate, sample_p=self.opt.sample_p)
 
             # random focal
             fov = random.random() * (self.opt.fovy_range[1] - self.opt.fovy_range[0]) + self.opt.fovy_range[0]
