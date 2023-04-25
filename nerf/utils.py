@@ -215,6 +215,8 @@ class Trainer(object):
                 p.requires_grad = False
 
             self.prepare_text_embeddings()
+            if self.opt.edit_text is not None:
+                self.edit_text_z = self.guidance.get_text_embeds([self.opt.edit_text], [self.opt.negative])
         
         else:
             self.text_z = None
@@ -307,7 +309,7 @@ class Trainer(object):
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
         
-        if self.opt.sd_version == "ip2p":
+        if self.opt.sd_version == "ip2p" or self.opt.ip2p_control:
             if self.opt.dmtet:
                 import nvdiffrast.torch as dr
                 # HACK: because dr is not pickable
@@ -444,25 +446,37 @@ class Trainer(object):
             dirs = data["dir"]  # [B,]
             all_pos = []
             all_neg = []
-            for emb in self.text_z[dirs]:  # list of [2, S, -1]
-                # Name flipped
-                pos, neg = emb.chunk(2)  # [1, S, -1]
-                all_pos.append(pos)
-                all_neg.append(neg)
-            text_z = torch.cat(all_pos + all_neg, dim=0)  # [2B, S, -1]
+            if self.opt.edit_text is not None:
+                edit_neg, edit_pos = self.edit_text_z.chunk(2)
+                for emb in self.text_z[dirs]:  # list of [2, S, -1]
+                    if random.random() > self.opt.mix_ratio:
+                        neg, pos = emb.chunk(2)  # [1, S, -1]
+                        all_neg.append(neg)
+                        all_pos.append(pos)
+                    else:
+                        all_neg.append(edit_neg)
+                        all_pos.append(edit_pos)
+            else:
+                for emb in self.text_z[dirs]:  # list of [2, S, -1]
+                    neg, pos = emb.chunk(2)  # [1, S, -1]
+                    all_neg.append(neg)
+                    all_pos.append(pos)
+            text_z = torch.cat(all_neg + all_pos, dim=0)  # [2B, S, -1]
         else:
             text_z = self.text_z
 
+        control = None
         if self.opt.flame and self.opt.mp_control:
             control = outputs["mp_control"]  
-        elif self.opt.sd_version == "ip2p":
+        if self.opt.sd_version == "ip2p" or self.opt.ip2p_control:
             with torch.no_grad():
                 self.copy_model.training = False
                 self.copy_model.eval()
                 copy_outputs = self.copy_model.run_cuda(data["copy_rays_o"], data["copy_rays_d"], staged=True, perturb=False, bg_color=None, ambient_ratio=ambient_ratio, shading=shading)
             control = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
-        else:
-            control = None
+            control = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
+            if self.opt.flame and self.opt.mp_control:
+                control = [outputs["mp_control"], control]
 
         # encode pred_rgb to latents
         loss = self.guidance.train_step(

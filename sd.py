@@ -1,5 +1,6 @@
 from transformers import CLIPTextModel, CLIPTokenizer, logging
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline, ControlNetModel, StableDiffusionInstructPix2PixPipeline
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_controlnet import MultiControlNetModel
 from diffusers.utils.import_utils import is_xformers_available
 from os.path import isfile
 
@@ -41,7 +42,7 @@ class UNet2DConditionOutput:
     sample: torch.HalfTensor # Not sure how to check what unet_traced.pt contains, and user wants. HalfTensor or FloatTensor
 
 class StableDiffusion(nn.Module):
-    def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98], use_control=True, gs=100, img_gs=20):
+    def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98], mp_control=True, ip2p_control=False, gs=100, img_gs=20):
         super().__init__()
 
         self.device = device
@@ -113,21 +114,34 @@ class StableDiffusion(nn.Module):
         self.text_encoder = pipe.text_encoder
         self.unet = pipe.unet
         
-        if use_control:
+        if mp_control:
             if self.sd_version == '1.5' or self.sd_version == 'back':
-                self.controlnet = ControlNetModel.from_pretrained(
+                mp_controlnet = ControlNetModel.from_pretrained(
                     "/storage/local/hanxiao/models/ControlNetMediaPipeFace",
                     torch_dtype=torch.float16,
                     # variant="fp16",
                     # subfolder="diffusion_sd15",
                 ).to(device)
             elif self.sd_version == '2.1':
-                self.controlnet = ControlNetModel.from_pretrained(
+                mp_controlnet = ControlNetModel.from_pretrained(
                     "CrucibleAI/ControlNetMediaPipeFace",
                     torch_dtype=torch.float16,
                     variant="fp16",
                 ).to(device)
-
+        
+        if ip2p_control:
+            ip2p_controlnet = ControlNetModel.from_pretrained(
+                "/storage/local/hanxiao/models/control_v11e_sd15_ip2p",
+                torch_dtype=torch.float16,
+            ).to(device)
+        
+        if mp_control and not ip2p_control:
+            self.controlnet = mp_controlnet
+        elif not mp_control and ip2p_control:
+            self.controlnet = ip2p_controlnet
+        elif mp_control and ip2p_control:
+            self.controlnet = MultiControlNetModel([mp_controlnet, ip2p_controlnet])
+            
         self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
 
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
@@ -187,9 +201,7 @@ class StableDiffusion(nn.Module):
                 # [prompt_embeds, negative_prompt_embeds, negative_prompt_embeds]
                 negative_prompt_embeds, prompt_embeds = text_embeddings.chunk(2)
                 text_embeddings = torch.cat([prompt_embeds, negative_prompt_embeds, negative_prompt_embeds], dim=0)
-                # condition_latents = copy.deepcopy(latents.detach())
-                condition = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
-                condition_latents = self.encode_imgs(condition)
+                condition_latents = self.encode_imgs(control)
                 condition_latents = torch.cat([condition_latents, condition_latents, torch.zeros_like(condition_latents)], dim=0)
                 inputs = torch.cat([latent_model_input, condition_latents], dim=1)
                 # noise_pred = self.unet(inputs, tt, encoder_hidden_states=text_embeddings).sample
@@ -216,13 +228,18 @@ class StableDiffusion(nn.Module):
                 if control is None:
                     noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
                 else:
-                    control = torch.cat([control] * 2)
+                    if isinstance(self.controlnet, MultiControlNetModel):
+                        control = [torch.cat([x] * 2) for x in control]
+                        control_scale = [1.0, 1.0]
+                    else:
+                        control = torch.cat([control] * 2)
+                        control_scale = 1.0
                     down_block_res_samples, mid_block_res_sample = self.controlnet(
                         latent_model_input,
                         tt,
                         encoder_hidden_states=text_embeddings,
                         controlnet_cond=control,
-                        conditioning_scale=1.0,
+                        conditioning_scale=control_scale,
                         return_dict=False,
                     )
                     # predict the noise residual
@@ -233,7 +250,11 @@ class StableDiffusion(nn.Module):
                         down_block_additional_residuals=down_block_res_samples,
                         mid_block_additional_residual=mid_block_res_sample,
                     ).sample
-                    is_back = control.sum(dim=3).sum(dim=2).sum(dim=1).eq(0)
+                    # FIXME: need refactor here
+                    if isinstance(self.controlnet, MultiControlNetModel):
+                        is_back = control[0].sum(dim=3).sum(dim=2).sum(dim=1).eq(0)
+                    else:
+                        is_back = control.sum(dim=3).sum(dim=2).sum(dim=1).eq(0)
                     if not torch.all(~is_back):
                         noise_pred_back = self.unet(
                             latent_model_input[is_back], tt[is_back], encoder_hidden_states=text_embeddings[is_back]

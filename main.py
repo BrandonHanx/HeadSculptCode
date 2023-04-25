@@ -40,6 +40,9 @@ if __name__ == '__main__':
     parser.add_argument('--gs', type=float, default=100, help="text cfg scale")
     parser.add_argument('--img_gs', type=float, default=20, help="image cfg scale")
     parser.add_argument('--sample_p', type=float, nargs='+', default=[1, 1, 1, 1], help="sample probability of [front, back, left, right]")
+    parser.add_argument('--ip2p_control', action='store_true', help="use InstructPix2Pix control net")
+    parser.add_argument('--edit_text', type=str, default=None, help="edit text prompt")
+    parser.add_argument('--mix_ratio', type=float, default=0.5, help="the probability of edit text will be used")
 
     ### training options
     parser.add_argument('--bs', type=int, default=1, help="batch size")
@@ -239,6 +242,7 @@ if __name__ == '__main__':
                 opt.hf_key,
                 opt.t_range, 
                 opt.mp_control,
+                opt.ip2p_control,
                 opt.gs,
                 opt.img_gs,
             )
