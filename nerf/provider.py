@@ -65,12 +65,12 @@ def get_view_direction(thetas, phis, overhead, front, back):
     res[(phis >= np.pi - back / 2) & (phis < np.pi + back / 2)] = 2
     res[(phis >= np.pi + back / 2) & (phis < 2 * np.pi - front / 2)] = 3
     # override by thetas
-    res[thetas <= overhead] = 4
-    res[thetas >= (np.pi - overhead)] = 5
+    # res[thetas <= overhead] = 4
+    # res[thetas >= (np.pi - overhead)] = 5
     return res
 
 
-def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[25, 110], phi_range=[0, 360], return_dirs=False, angle_overhead=30, angle_front=70, angle_back=70, jitter=False, uniform_sphere_rate=0.5, sample_p=[1, 1, 1, 1]):
+def rand_poses(size, device, radius_range=[1, 1.5], theta_range=[20, 110], phi_range=[0, 360], return_dirs=False, angle_overhead=30, angle_front=70, angle_back=70, jitter=False, uniform_sphere_rate=0.5, sample_p=[1, 1, 1, 1]):
     ''' generate random poses from an orbit camera
     Args:
         size: batch size of generated poses.
@@ -233,7 +233,7 @@ class NeRFDataset:
 
         if self.training:
             # random pose on the fly
-            poses, dirs = rand_poses(B, self.device, radius_range=self.opt.radius_range, return_dirs=self.opt.dir_text, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, angle_back=self.opt.angle_back, jitter=self.opt.jitter_pose, uniform_sphere_rate=self.opt.uniform_sphere_rate, sample_p=self.opt.sample_p)
+            poses, dirs = rand_poses(B, self.device, radius_range=self.opt.radius_range, theta_range=self.opt.theta_range, return_dirs=self.opt.dir_text, angle_overhead=self.opt.angle_overhead, angle_front=self.opt.angle_front, angle_back=self.opt.angle_back, jitter=self.opt.jitter_pose, uniform_sphere_rate=self.opt.uniform_sphere_rate, sample_p=self.opt.sample_p)
 
             # random focal
             fov = random.random() * (self.opt.fovy_range[1] - self.opt.fovy_range[0]) + self.opt.fovy_range[0]

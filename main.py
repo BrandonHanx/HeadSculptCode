@@ -28,10 +28,11 @@ if __name__ == '__main__':
     parser.add_argument('--decimate_target', type=int, default=5e4, help="target face number for mesh decimation")
 
     parser.add_argument('--dmtet', action='store_true', help="use dmtet finetuning")
-    parser.add_argument('--tet_grid_size', type=int, default=128, help="tet grid size")
+    parser.add_argument('--tet_grid_size', type=int, default=256, help="tet grid size")
     parser.add_argument('--init_ckpt', type=str, default='', help="ckpt to init dmtet")
     
     parser.add_argument('--flame', action='store_true', help="use flame guide density")
+    parser.add_argument('--flame_path', type=str, default='flame.obj', help="path to obj")
     parser.add_argument('--mp_control', action='store_true', help="use MediaPipe control net")
     parser.add_argument('--normal_net', action='store_true', help="use normal net")
     parser.add_argument('--albedo', action='store_true', help="only using albedo for shading during training")
@@ -43,10 +44,14 @@ if __name__ == '__main__':
     parser.add_argument('--ip2p_control', action='store_true', help="use InstructPix2Pix control net")
     parser.add_argument('--edit_text', type=str, default=None, help="edit text prompt")
     parser.add_argument('--mix_ratio', type=float, default=0.5, help="the probability of edit text will be used")
+    parser.add_argument('--grad_clip', type=float, default=None, help="grad clip interval for stable diffusion")
+    parser.add_argument('--lr_x', type=float, default=1, help="lr multiplier for fine-tuning")
+    parser.add_argument('--front_only', action='store_true', help="front only when doing mix editing")
+
 
     ### training options
     parser.add_argument('--bs', type=int, default=1, help="batch size")
-    parser.add_argument('--iters', type=int, default=10000, help="training iters")
+    parser.add_argument('--iters', type=int, default=7000, help="training iters")
     parser.add_argument('--lr', type=float, default=1e-3, help="max learning rate")
     parser.add_argument('--warm_iters', type=int, default=500, help="training iters")
     parser.add_argument('--min_lr', type=float, default=1e-4, help="minimal learning rate")
@@ -84,6 +89,7 @@ if __name__ == '__main__':
     parser.add_argument('--dt_gamma', type=float, default=0, help="dt_gamma (>=0) for adaptive ray marching. set to 0 to disable, >0 to accelerate rendering (but usually with worse quality)")
     parser.add_argument('--min_near', type=float, default=0.1, help="minimum near distance for camera")
     parser.add_argument('--radius_range', type=float, nargs='*', default=[1.0, 1.5], help="training camera radius range")
+    parser.add_argument('--theta_range', type=float, nargs='*', default=[20, 110], help="training camera theta range")
     parser.add_argument('--fovy_range', type=float, nargs='*', default=[30, 50], help="training camera fovy range")
     parser.add_argument('--dir_text', action='store_true', help="direction-encode the text prompt, by appending front/side/back/overhead view")
     parser.add_argument('--suppress_face', action='store_true', help="also use negative dir text prompt.")
@@ -104,6 +110,7 @@ if __name__ == '__main__':
     parser.add_argument('--src_img', type=str, default="", help="the path of the src image used for arcface")
     parser.add_argument('--lambda_saturation', type=float, default=0, help="loss scale for saturation loss")
     parser.add_argument('--lambda_angle', type=float, default=0, help="loss scale for angle cosine sim loss")
+    parser.add_argument('--lambda_color', type=float, default=0, help="loss scale for color regularization")
 
     ### GUI options
     parser.add_argument('--gui', action='store_true', help="start a GUI")
@@ -134,7 +141,7 @@ if __name__ == '__main__':
         # parameters for finetuning
         opt.h = 512
         opt.w = 512
-        opt.warmup_iters = 0
+        # opt.warmup_iters = 0
         opt.t_range = [0.02, 0.50]
         opt.fovy_range = [30, 50]
 

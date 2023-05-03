@@ -292,7 +292,7 @@ class NeRFRenderer(nn.Module):
         self.glctx = None
         
         if self.opt.flame:
-            v, _, _, f, _, _ = read_obj("flame.obj", float)
+            v, _, _, f, _, _ = read_obj(self.opt.flame_path, float)
             v = normalize_mesh(v, 0.7)
             self.faces = torch.Tensor(f).to(torch.int64).cuda()
             self.vt = torch.Tensor(v).cuda().unsqueeze(0)

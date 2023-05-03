@@ -309,7 +309,7 @@ class Trainer(object):
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
         
-        if self.opt.sd_version == "ip2p" or self.opt.ip2p_control:
+        if self.opt.sd_version == "ip2p" or self.opt.ip2p_control or self.opt.lambda_color > 0:
             if self.opt.dmtet:
                 import nvdiffrast.torch as dr
                 # HACK: because dr is not pickable
@@ -340,7 +340,7 @@ class Trainer(object):
             self.text_z = []
             for d in ['front', 'side', 'back', 'side', 'overhead', 'bottom']:
                 # construct dir-encoded text
-                text = f"{self.opt.text}, {d} view"
+                text = f"{self.opt.text}, {d} view of head"
                 
                 if d == "back" and self.opt.sd_version == "back":
                     text = f"{text}, <back-view>, without eyes, without faces"
@@ -448,8 +448,9 @@ class Trainer(object):
             all_neg = []
             if self.opt.edit_text is not None:
                 edit_neg, edit_pos = self.edit_text_z.chunk(2)
-                for emb in self.text_z[dirs]:  # list of [2, S, -1]
-                    if random.random() > self.opt.mix_ratio:
+                for emb, d in zip(self.text_z[dirs], dirs):  # list of [2, S, -1]
+                    front_only = self.opt.front_only and d != 0
+                    if random.random() > self.opt.mix_ratio or front_only:
                         neg, pos = emb.chunk(2)  # [1, S, -1]
                         all_neg.append(neg)
                         all_pos.append(pos)
@@ -473,16 +474,17 @@ class Trainer(object):
                 self.copy_model.training = False
                 self.copy_model.eval()
                 copy_outputs = self.copy_model.run_cuda(data["copy_rays_o"], data["copy_rays_d"], staged=True, perturb=False, bg_color=None, ambient_ratio=ambient_ratio, shading=shading)
-            control = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
-            control = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
+            copy_rgb = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
+            copy_rgb = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
             if self.opt.flame and self.opt.mp_control:
-                control = [outputs["mp_control"], control]
+                control = [outputs["mp_control"], copy_rgb]
 
         # encode pred_rgb to latents
         loss = self.guidance.train_step(
             text_z, 
             pred_rgb, 
             as_latent=as_latent,
+            grad_clip=self.opt.grad_clip,
             control=control,
         )
 
@@ -541,6 +543,16 @@ class Trainer(object):
                 other_feats = F.normalize(feats[~front_idx], p=2, dim=-1, eps=1e-5)
                 loss_angle = front_feats @ other_feats.t()
                 loss = loss + self.opt.lambda_angle * loss_angle.mean()
+        
+        if self.opt.lambda_color > 0 and self.global_step < self.opt.warmup_iters:
+            with torch.no_grad():
+                self.copy_model.training = False
+                self.copy_model.eval()
+                copy_outputs = self.copy_model.run_cuda(data["copy_rays_o"], data["copy_rays_d"], staged=True, perturb=False, bg_color=None, ambient_ratio=ambient_ratio, shading=shading)
+            copy_rgb = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
+            copy_rgb = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
+            color_loss = F.mse_loss(pred_rgb, copy_rgb)
+            loss = loss + self.opt.lambda_color * color_loss
 
         return pred_rgb, pred_depth, loss
     
@@ -953,7 +965,10 @@ class Trainer(object):
                 self.local_step += 1
 
                 if self.global_step <= self.opt.warmup_iters:
-                    data['shading'] = 'normal'
+                    if self.opt.albedo:
+                        data['shading'] = 'albedo'
+                    else:
+                        data['shading'] = 'normal'
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     preds, preds_depth, loss = self.eval_step(data)
 
