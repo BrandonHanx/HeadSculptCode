@@ -47,7 +47,9 @@ if __name__ == '__main__':
     parser.add_argument('--grad_clip', type=float, default=None, help="grad clip interval for stable diffusion")
     parser.add_argument('--lr_x', type=float, default=1, help="lr multiplier for fine-tuning")
     parser.add_argument('--front_only', action='store_true', help="front only when doing mix editing")
-
+    parser.add_argument('--edit_cfg', type=float, default=0., help="cfg for edit")
+    parser.add_argument('--fine_edit', action='store_true', help="editing with fine stage as init")
+    parser.add_argument('--drop_sdf', action='store_true', help="drop sdf weight when editing with fine stage as init")
 
     ### training options
     parser.add_argument('--bs', type=int, default=1, help="batch size")
@@ -194,6 +196,8 @@ if __name__ == '__main__':
         if opt.cuda_ray:
             model.mean_density = state_dict['mean_density']
         model.init_tet()
+        if "sdf" in state_dict["model"]:
+            model.sdf.data = state_dict["model"]["sdf"].data
 
     print(model)
 
@@ -252,6 +256,8 @@ if __name__ == '__main__':
                 opt.ip2p_control,
                 opt.gs,
                 opt.img_gs,
+                opt.edit_cfg,
+                opt.front_only,
             )
         elif opt.guidance == 'clip':
             from nerf.clip import CLIP

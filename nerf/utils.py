@@ -29,6 +29,8 @@ from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
+from pygifsicle import optimize
+
 
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
@@ -317,10 +319,20 @@ class Trainer(object):
                 self.copy_model = copy.deepcopy(self.model).eval()
                 if self.opt.gui:
                     self.model.glctx = dr.RasterizeCudaContext()
-                    # self.copy_model.glctx = dr.RasterizeCudaContext()
+                    self.copy_model.glctx = dr.RasterizeCudaContext()
                 else:
                     self.model.glctx = dr.RasterizeGLContext()
-                    # self.copy_model.glctx = dr.RasterizeGLContext()
+                    self.copy_model.glctx = dr.RasterizeGLContext()
+                if self.opt.fine_edit and self.opt.drop_sdf:
+                    self.model.sdf.data = self.model.sdf.data * 0
+                    self.model.deform.data = self.model.deform.data * 0
+                    tets = np.load('tets/{}_tets.npz'.format(self.opt.tet_grid_size))
+                    if self.opt.tet_grid_size == 256:
+                        vertices = tets['vertices'] - 0.5
+                    else:
+                        vertices = tets['vertices']
+                    self.model.verts = -1.0 * torch.tensor(vertices, dtype=torch.float32, device='cuda') * 2 # covers [-1, 1]
+                    self.model.init_tet()
             else:
                 self.copy_model = copy.deepcopy(self.model).eval()
             for param in self.copy_model.parameters():
@@ -446,23 +458,33 @@ class Trainer(object):
             dirs = data["dir"]  # [B,]
             all_pos = []
             all_neg = []
-            if self.opt.edit_text is not None:
-                edit_neg, edit_pos = self.edit_text_z.chunk(2)
-                for emb, d in zip(self.text_z[dirs], dirs):  # list of [2, S, -1]
-                    front_only = self.opt.front_only and d != 0
-                    if random.random() > self.opt.mix_ratio or front_only:
-                        neg, pos = emb.chunk(2)  # [1, S, -1]
-                        all_neg.append(neg)
-                        all_pos.append(pos)
-                    else:
-                        all_neg.append(edit_neg)
-                        all_pos.append(edit_pos)
-            else:
+            if self.opt.edit_cfg > 0:
+                all_edit_pos = []
+                _, edit_pos = self.edit_text_z.chunk(2)
                 for emb in self.text_z[dirs]:  # list of [2, S, -1]
                     neg, pos = emb.chunk(2)  # [1, S, -1]
                     all_neg.append(neg)
                     all_pos.append(pos)
-            text_z = torch.cat(all_neg + all_pos, dim=0)  # [2B, S, -1]
+                    all_edit_pos.append(edit_pos)
+                text_z = torch.cat(all_neg + all_pos + all_edit_pos, dim=0)
+            else:
+                if self.opt.edit_text is not None:
+                    edit_neg, edit_pos = self.edit_text_z.chunk(2)
+                    for emb, d in zip(self.text_z[dirs], dirs):  # list of [2, S, -1]
+                        front_only = self.opt.front_only and d != 0
+                        if random.random() > self.opt.mix_ratio or front_only:
+                            neg, pos = emb.chunk(2)  # [1, S, -1]
+                            all_neg.append(neg)
+                            all_pos.append(pos)
+                        else:
+                            all_neg.append(edit_neg)
+                            all_pos.append(edit_pos)
+                else:
+                    for emb in self.text_z[dirs]:  # list of [2, S, -1]
+                        neg, pos = emb.chunk(2)  # [1, S, -1]
+                        all_neg.append(neg)
+                        all_pos.append(pos)
+                text_z = torch.cat(all_neg + all_pos, dim=0)  # [2B, S, -1]
         else:
             text_z = self.text_z
 
@@ -473,11 +495,17 @@ class Trainer(object):
             with torch.no_grad():
                 self.copy_model.training = False
                 self.copy_model.eval()
-                copy_outputs = self.copy_model.run_cuda(data["copy_rays_o"], data["copy_rays_d"], staged=True, perturb=False, bg_color=None, ambient_ratio=ambient_ratio, shading=shading)
-            copy_rgb = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
-            copy_rgb = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
+                if self.opt.fine_edit:
+                    copy_outputs = self.copy_model.run_dmtet(rays_d, mvp, H, W, ambient_ratio=1.0, shading="albedo", bg_color=None)
+                    copy_rgb = copy_outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous().detach()
+                else:
+                    copy_outputs = self.copy_model.run_cuda(data["copy_rays_o"], data["copy_rays_d"], staged=True, perturb=False, bg_color=None, ambient_ratio=ambient_ratio, shading="albedo")
+                    copy_rgb = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
+                    copy_rgb = F.interpolate(copy_rgb, (512, 512), mode='bilinear', align_corners=False)
             if self.opt.flame and self.opt.mp_control:
                 control = [outputs["mp_control"], copy_rgb]
+            else:
+                control = copy_rgb
 
         # encode pred_rgb to latents
         loss = self.guidance.train_step(
@@ -486,6 +514,7 @@ class Trainer(object):
             as_latent=as_latent,
             grad_clip=self.opt.grad_clip,
             control=control,
+            dirs=data["dir"] if self.opt.dir_text else None,
         )
 
         # regularizations
@@ -524,35 +553,35 @@ class Trainer(object):
                 loss_saturation = pred_hsv[:, 1].mean() - pred_hsv[:, 2].mean()
                 loss = loss + self.opt.lambda_saturation * loss_saturation
             
-        if self.opt.lambda_identity > 0 and outputs["front_faces"] is not None:
-            self.arcface.eval()
-            with torch.no_grad():
-                front_feats = self.arcface(outputs["front_faces"])
-                front_feats = F.normalize(front_feats, p=2, dim=-1)
-            sim = self.src_feats @ front_feats.t()
-            loss_identity = 1 - sim.mean()
-            loss = loss + self.opt.lambda_identity * loss_identity
+        # if self.opt.lambda_identity > 0 and outputs["front_faces"] is not None:
+        #     self.arcface.eval()
+        #     with torch.no_grad():
+        #         front_feats = self.arcface(outputs["front_faces"])
+        #         front_feats = F.normalize(front_feats, p=2, dim=-1)
+        #     sim = self.src_feats @ front_feats.t()
+        #     loss_identity = 1 - sim.mean()
+        #     loss = loss + self.opt.lambda_identity * loss_identity
         
-        if self.opt.lambda_angle > 0:
-            front_idx = data["dir"] == 0
-            if torch.any(front_idx):
-                feats = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
-                feats = F.interpolate(feats, (112, 112), mode='bilinear', align_corners=False)
-                feats = self.arcface(feats)
-                front_feats = F.normalize(feats[front_idx], p=2, dim=-1, eps=1e-5)
-                other_feats = F.normalize(feats[~front_idx], p=2, dim=-1, eps=1e-5)
-                loss_angle = front_feats @ other_feats.t()
-                loss = loss + self.opt.lambda_angle * loss_angle.mean()
+        # if self.opt.lambda_angle > 0:
+        #     front_idx = data["dir"] == 0
+        #     if torch.any(front_idx):
+        #         feats = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
+        #         feats = F.interpolate(feats, (112, 112), mode='bilinear', align_corners=False)
+        #         feats = self.arcface(feats)
+        #         front_feats = F.normalize(feats[front_idx], p=2, dim=-1, eps=1e-5)
+        #         other_feats = F.normalize(feats[~front_idx], p=2, dim=-1, eps=1e-5)
+        #         loss_angle = front_feats @ other_feats.t()
+        #         loss = loss + self.opt.lambda_angle * loss_angle.mean()
         
-        if self.opt.lambda_color > 0 and self.global_step < self.opt.warmup_iters:
-            with torch.no_grad():
-                self.copy_model.training = False
-                self.copy_model.eval()
-                copy_outputs = self.copy_model.run_cuda(data["copy_rays_o"], data["copy_rays_d"], staged=True, perturb=False, bg_color=None, ambient_ratio=ambient_ratio, shading=shading)
-            copy_rgb = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
-            copy_rgb = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
-            color_loss = F.mse_loss(pred_rgb, copy_rgb)
-            loss = loss + self.opt.lambda_color * color_loss
+        # if self.opt.lambda_color > 0 and self.global_step < self.opt.warmup_iters:
+        #     with torch.no_grad():
+        #         self.copy_model.training = False
+        #         self.copy_model.eval()
+        #         copy_outputs = self.copy_model.run_cuda(data["copy_rays_o"], data["copy_rays_d"], staged=True, perturb=False, bg_color=None, ambient_ratio=ambient_ratio, shading=shading)
+        #     copy_rgb = copy_outputs['image'].reshape(B, 64, 64, 3).permute(0, 3, 1, 2).contiguous().detach()
+        #     copy_rgb = F.interpolate(control, (512, 512), mode='bilinear', align_corners=False)
+        #     color_loss = F.mse_loss(pred_rgb, copy_rgb)
+        #     loss = loss + self.opt.lambda_color * color_loss
 
         return pred_rgb, pred_depth, loss
     
@@ -697,37 +726,51 @@ class Trainer(object):
 
         if write_video:
             all_preds = []
-            all_preds_depth = []
+            all_preds_normal = []
 
         with torch.no_grad():
 
             for i, data in enumerate(loader):
                 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, _ = self.test_step(data)
+                    preds, _, _ = self.test_step(data)
+                    data["shading"] = "normal"
+                    preds_normal, _, _ = self.test_step(data)
 
                 pred = preds[0].detach().cpu().numpy()
                 pred = (pred * 255).astype(np.uint8)
+                
+                pred_normal = preds_normal[0].detach().cpu().numpy()
+                pred_normal = (pred_normal * 255).astype(np.uint8)
 
-                pred_depth = preds_depth[0].detach().cpu().numpy()
-                pred_depth = (pred_depth - pred_depth.min()) / (pred_depth.max() - pred_depth.min() + 1e-6)
-                pred_depth = (pred_depth * 255).astype(np.uint8)
+                # pred_depth = preds_depth[0].detach().cpu().numpy()
+                # pred_depth = (pred_depth - pred_depth.min()) / (pred_depth.max() - pred_depth.min() + 1e-6)
+                # pred_depth = (pred_depth * 255).astype(np.uint8)
 
                 if write_video:
+                    pred = cv2.resize(pred, (256, 256))
+                    pred_normal = cv2.resize(pred_normal, (256, 256))
                     all_preds.append(pred)
-                    all_preds_depth.append(pred_depth)
+                    all_preds_normal.append(pred_normal)
                 else:
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_rgb.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_depth.png'), pred_depth)
+                    # cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_depth.png'), pred_depth)
+                    cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_normal.png'), cv2.cvtColor(pred_normal, cv2.COLOR_RGB2BGR))
 
                 pbar.update(1)
 
         if write_video:
             all_preds = np.stack(all_preds, axis=0)
-            all_preds_depth = np.stack(all_preds_depth, axis=0)
+            all_preds_normal = np.stack(all_preds_normal, axis=0)
             
-            imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
-            imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
+            imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.gif'), all_preds, fps=25)
+            imageio.mimwrite(os.path.join(save_path, f'{name}_normal.gif'), all_preds_normal, fps=25)
+            
+            optimize(os.path.join(save_path, f'{name}_rgb.gif'))
+            optimize(os.path.join(save_path, f'{name}_normal.gif'))
+            
+            # imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
+            # imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
 
         self.log(f"==> Finished Test.")
     

@@ -870,7 +870,7 @@ class NeRFRenderer(nn.Module):
 
         B = mvp.shape[0]
         device = mvp.device
-        campos = mvp[:, :3, 3]
+        campos = -mvp[:, 3, :3]
         results = {}
 
         # random sample light_d if not provided
@@ -934,12 +934,14 @@ class NeRFRenderer(nn.Module):
         elif shading == 'textureless':
             # lambertian = ambient_ratio + (1 - ambient_ratio)  * (normal @ light_d).float().clamp(min=0)
             # color = lambertian.unsqueeze(-1).repeat(1, 1, 1, 3)
+            ambient_ratio = 0
             lambertian = ambient_ratio + (1 - ambient_ratio)  * torch.bmm(normal.view(B, -1, 3), light_d.unsqueeze(-1)).float().clamp(min=0)
             color = lambertian.view(B, h, w, 1).repeat(1, 1, 1, 3)
         elif shading == 'normal':
             color = (normal + 1) / 2
         else: # 'lambertian'
             lambertian = ambient_ratio + (1 - ambient_ratio)  * torch.bmm(normal.view(B, -1, 3), light_d.unsqueeze(-1)).float().clamp(min=0)
+            # lambertian = ambient_ratio + (1 - ambient_ratio)  * (normal * light_d.view(-1, 1, 1, 3)).sum(-1).float().clamp(min=0)
             color = albedo * lambertian.view(B, h, w, 1)
 
         color = dr.antialias(color, rast, verts_clip, faces).clamp(0, 1) # [B, H, W, 3]
@@ -955,7 +957,9 @@ class NeRFRenderer(nn.Module):
         
         depth = rast[:, :, :, [2]] # [B, H, W]
         color = color + (1 - alpha) * bg_color
-
+        if not self.training and shading in ["normal", "textureless"]:
+            color[depth.squeeze(-1) == 0] = 1
+        
         results['depth'] = depth        
         results['image'] = color
         results['weights_sum'] = alpha.squeeze(-1)
@@ -1153,6 +1157,7 @@ class NeRFRenderer(nn.Module):
         device = rays_o.device
 
         if self.dmtet:
+            # kwargs["light_d"] = safe_normalize(rays_o).view(-1, 3)[0:1]
             results = self.run_dmtet(rays_d, mvp, h, w, **kwargs)
         elif self.cuda_ray:
             results = self.run_cuda(rays_o, rays_d, **kwargs)

@@ -42,13 +42,15 @@ class UNet2DConditionOutput:
     sample: torch.HalfTensor # Not sure how to check what unet_traced.pt contains, and user wants. HalfTensor or FloatTensor
 
 class StableDiffusion(nn.Module):
-    def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98], mp_control=True, ip2p_control=False, gs=100, img_gs=20):
+    def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98], mp_control=True, ip2p_control=False, gs=100, img_gs=20, edit_cfg=0, front_only=False):
         super().__init__()
 
         self.device = device
         self.sd_version = sd_version
         self.gs = gs
         self.img_gs = img_gs
+        self.edit_cfg = edit_cfg
+        self.front_only = front_only
 
         print(f'[INFO] loading stable diffusion...')
 
@@ -169,10 +171,69 @@ class StableDiffusion(nn.Module):
         # Cat for final embeddings
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
         return text_embeddings
+    
+    def pred_w_controlnet(self, text_embeddings, latent_model_input, tt, control, is_back):
+        ip2p_control = torch.cat([control[1]] * 2)
+        all_control = [torch.cat([x] * 2) for x in control]
+        if not torch.all(~is_back):
+            # we don't use landmark control on the back
+            noise_pred = torch.zeros_like(latent_model_input).half()
+            down_block_res_samples, mid_block_res_sample = self.controlnet.nets[1](
+                latent_model_input[is_back],
+                tt[is_back],
+                encoder_hidden_states=text_embeddings[is_back],
+                controlnet_cond=ip2p_control[is_back],
+                conditioning_scale=1.0,
+                return_dict=False,
+            )
+            noise_pred_back = self.unet(
+                latent_model_input[is_back], 
+                tt[is_back], 
+                encoder_hidden_states=text_embeddings[is_back],
+                down_block_additional_residuals=down_block_res_samples,
+                mid_block_additional_residual=mid_block_res_sample,
+            ).sample
+            down_block_res_samples, mid_block_res_sample = self.controlnet(
+                latent_model_input[~is_back],
+                tt[~is_back],
+                encoder_hidden_states=text_embeddings[~is_back],
+                controlnet_cond=[all_control[0][~is_back], all_control[1][~is_back]],
+                conditioning_scale=[1.0, 1.0],
+                return_dict=False,
+            )
+            noise_pred_other = self.unet(
+                latent_model_input[~is_back], 
+                tt[~is_back], 
+                encoder_hidden_states=text_embeddings[~is_back],
+                down_block_additional_residuals=down_block_res_samples,
+                mid_block_additional_residual=mid_block_res_sample,
+            ).sample
+            noise_pred[is_back] = noise_pred_back
+            noise_pred[~is_back] = noise_pred_other
+        else:
+            down_block_res_samples, mid_block_res_sample = self.controlnet(
+                latent_model_input,
+                tt,
+                encoder_hidden_states=text_embeddings,
+                controlnet_cond=all_control,
+                conditioning_scale=[1.0, 1.0],
+                return_dict=False,
+            )
+            noise_pred = self.unet(
+                latent_model_input,
+                tt,
+                encoder_hidden_states=text_embeddings,
+                down_block_additional_residuals=down_block_res_samples,
+                mid_block_additional_residual=mid_block_res_sample,
+            ).sample
+        noise_pred_uncond, noise_pred = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + self.gs * (noise_pred - noise_pred_uncond)
+        return noise_pred
+
 
 
     # HACK: this guidance_scale is not used, overwritten by self.gs
-    def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, as_latent=False, grad_clip=None, control=None):
+    def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, as_latent=False, grad_clip=None, control=None, dirs=None):
         B = pred_rgb.shape[0]
 
         if as_latent:
@@ -223,52 +284,97 @@ class StableDiffusion(nn.Module):
                     + self.img_gs * (noise_pred_image - noise_pred_uncond)
                 )
             else:
-                latent_model_input = torch.cat([latents_noisy] * 2)
-                tt = torch.cat([t] * 2)
-                if control is None:
-                    noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
+                if self.edit_cfg > 0:
+                    latent_model_input = torch.cat([latents_noisy] * 2)
+                    tt = torch.cat([t] * 2)
+                    text_neg, text_pos, text_edit_pos = text_embeddings.chunk(3)
+                    
+                    dirs = torch.cat([dirs] * 2)
+                    is_back = dirs == 2
+                    # text cfg
+                    noise_pred_text = self.pred_w_controlnet(
+                        torch.cat([text_neg, text_pos]), 
+                        latent_model_input, 
+                        tt, 
+                        control, 
+                        is_back,
+                    )                 
+                    # edit cfg
+                    edit_embeddings = torch.cat([text_neg, text_edit_pos])
+                    if self.front_only:
+                        # is_front = dirs == 0
+                        is_front = ~is_back
+                        noise_pred_edit = copy.deepcopy(noise_pred_text)
+                        if not torch.all(~is_front):
+                            is_front_, _ = is_front.chunk(2)
+                            noise_pred_edit_front = self.pred_w_controlnet(
+                                edit_embeddings[is_front], 
+                                latent_model_input[is_front], 
+                                tt[is_front], 
+                                [control[0][is_front_], control[1][is_front_]], 
+                                torch.zeros_like(is_front).bool(),
+                            )
+                            noise_pred_edit[is_front_] = noise_pred_edit_front
+                    else:
+                        noise_pred_edit = self.pred_w_controlnet(
+                            edit_embeddings, 
+                            latent_model_input, 
+                            tt, 
+                            control, 
+                            is_back,
+                        )     
+                    # mix
+                    noise_pred = self.edit_cfg * (noise_pred_edit - noise_pred_text) + noise_pred_text
+                    
                 else:
-                    if isinstance(self.controlnet, MultiControlNetModel):
-                        control = [torch.cat([x] * 2) for x in control]
-                        control_scale = [1.0, 1.0]
+                    latent_model_input = torch.cat([latents_noisy] * 2)
+                    tt = torch.cat([t] * 2)
+                    if control is None:
+                        noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
                     else:
-                        control = torch.cat([control] * 2)
-                        control_scale = 1.0
-                    down_block_res_samples, mid_block_res_sample = self.controlnet(
-                        latent_model_input,
-                        tt,
-                        encoder_hidden_states=text_embeddings,
-                        controlnet_cond=control,
-                        conditioning_scale=control_scale,
-                        return_dict=False,
-                    )
-                    # predict the noise residual
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        tt,
-                        encoder_hidden_states=text_embeddings,
-                        down_block_additional_residuals=down_block_res_samples,
-                        mid_block_additional_residual=mid_block_res_sample,
-                    ).sample
-                    # FIXME: need refactor here
-                    if isinstance(self.controlnet, MultiControlNetModel):
-                        is_back = control[0].sum(dim=3).sum(dim=2).sum(dim=1).eq(0)
-                    else:
-                        is_back = control.sum(dim=3).sum(dim=2).sum(dim=1).eq(0)
-                    if not torch.all(~is_back):
-                        noise_pred_back = self.unet(
-                            latent_model_input[is_back], tt[is_back], encoder_hidden_states=text_embeddings[is_back]
+                        if isinstance(self.controlnet, MultiControlNetModel):
+                            control = [torch.cat([x] * 2) for x in control]
+                            control_scale = [1.0, 1.0]
+                        else:
+                            control = torch.cat([control] * 2)
+                            control_scale = 1.0
+                        down_block_res_samples, mid_block_res_sample = self.controlnet(
+                            latent_model_input,
+                            tt,
+                            encoder_hidden_states=text_embeddings,
+                            controlnet_cond=control,
+                            conditioning_scale=control_scale,
+                            return_dict=False,
+                        )
+                        # predict the noise residual
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            tt,
+                            encoder_hidden_states=text_embeddings,
+                            down_block_additional_residuals=down_block_res_samples,
+                            mid_block_additional_residual=mid_block_res_sample,
                         ).sample
-                        noise_pred[is_back] = noise_pred_back
+                        # FIXME: need refactor here
+                        if isinstance(self.controlnet, MultiControlNetModel):
+                            is_back = control[0].sum(dim=3).sum(dim=2).sum(dim=1).eq(0)
+                        else:
+                            is_back = control.sum(dim=3).sum(dim=2).sum(dim=1).eq(0)
+                        if not torch.all(~is_back):
+                            noise_pred_back = self.unet(
+                                latent_model_input[is_back], tt[is_back], encoder_hidden_states=text_embeddings[is_back]
+                            ).sample
+                            noise_pred[is_back] = noise_pred_back
 
-                # perform guidance (high scale from paper!)
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_text + self.gs * (noise_pred_text - noise_pred_uncond)
+                    # perform guidance (high scale from paper!)
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_text + self.gs * (noise_pred_text - noise_pred_uncond)
 
         # w(t), sigma_t^2
         # w = (1 - self.alphas[t])
         w = self.alphas[t] ** 0.5 * (1 - self.alphas[t])
         grad = w.view(-1, 1, 1, 1) * (noise_pred - noise)
+        # import numpy as np
+        # np.save("grad.npy", grad.detach().cpu().numpy())
 
         if grad_clip is not None:
             grad = grad.clamp(-grad_clip, grad_clip)
